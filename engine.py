@@ -4,6 +4,12 @@ import numpy as np
 
 def get_base_df(price_list):
     """Processes technical indicators for all strategies"""
+    
+    # 1. OPTIMIZATION: Only process the last 100 rows. 
+    # This prevents the CPU from grinding to a halt when the array gets huge.
+    if len(price_list) > 100:
+        price_list = price_list[-100:]
+        
     df = pd.DataFrame(price_list, columns=['price'])
     
     # Standard Moving Averages
@@ -16,7 +22,7 @@ def get_base_df(price_list):
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan))))
-    df['rsi'] = df['rsi'].fillna(50) # Neutral RSI if no movement
+    df['rsi'] = df['rsi'].fillna(50) 
     
     return df
 
@@ -47,30 +53,31 @@ def strategy_scalper(current):
     return "WAIT"
 
 # --- STRATEGY 3: MODERATE INTRADAY (The "Active Trader") ---
-def strategy_moderate(current):
+def strategy_moderate(current, current_time=None):
     """
     Designed for 5-minute charts to yield 2-3 trades per day.
     Uses Trend-Aligned Mean Reversion.
     """
+    # 2. TIME FILTER: Avoid taking new trades after 3:00 PM (15:00)
+    if current_time is not None:
+        if current_time.hour >= 15:
+            return "WAIT"
+
     upper = current['ma_20'] + (current['std_20'] * 2)
     lower = current['ma_20'] - (current['std_20'] * 2)
     
-    # Determine the intraday trend using the 50 MA
     is_uptrend = current['ma_20'] > current['ma_50']
     is_downtrend = current['ma_20'] < current['ma_50']
     
-    # BUY: In an uptrend, buy the 2-Standard Deviation dip when RSI cools off.
     if is_uptrend and (current['price'] <= lower) and (current['rsi'] <= 45):
         return "BUY"
-        
-    # SELL: In a downtrend, short the 2-Standard Deviation rip when RSI is warm.
     elif is_downtrend and (current['price'] >= upper) and (current['rsi'] >= 55):
         return "SELL"
         
     return "WAIT"
 
 # --- MAIN DISPATCHER ---
-def calculate_signals(price_list, strategy_name="moderate"):
+def calculate_signals(price_list, current_time=None, strategy_name="moderate"):
     if len(price_list) < 50:
         return {"action": "WAIT", "rsi": 50, "ma": 0}
     
@@ -82,7 +89,7 @@ def calculate_signals(price_list, strategy_name="moderate"):
     elif strategy_name == "scalper":
         action = strategy_scalper(current)
     elif strategy_name == "moderate":
-        action = strategy_moderate(current)
+        action = strategy_moderate(current, current_time)
     else:
         action = "WAIT"
 
@@ -96,9 +103,11 @@ def calculate_signals(price_list, strategy_name="moderate"):
     }
 
 def risk_management(capital):
+    # 3. REALISTIC INTRADAY RISK
+    # On a 23,000 Nifty: 0.13% is ~30 points. 0.065% is ~15 points.
     return {
         "position_size": capital,
-        "stop_loss_pct": 0.005,  # Tightened to 0.5% for intraday safety
-        "target_pct": 0.01,      # 1% target (easily covers the Rs 50 goal)
-        "brokerage_fee": 60 
+        "stop_loss_pct": 0.00065, # Tight Intraday Stop (Protects Capital)
+        "target_pct": 0.0013,     # Realistic 5-minute target (Easily hits Rs 50+ net)
+        "brokerage_fee": 120      # Fully loaded 2026 costs
     }
