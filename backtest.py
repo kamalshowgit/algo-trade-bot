@@ -7,7 +7,6 @@ LOT_SIZE = 65
 CAPITAL = 100000
 
 def run_true_backtest(symbol="^NSEI", days=60, strategy="moderate"):
-    # Fetching 60 days of 5-minute data (Max allowed by free YFinance)
     print(f"Fetching {days} days of 5-minute data for {symbol}...")
     df = yf.download(symbol, period=f"{days}d", interval="5m")
     
@@ -15,10 +14,10 @@ def run_true_backtest(symbol="^NSEI", days=60, strategy="moderate"):
         print("Failed to fetch data.")
         return
 
-    prices = df['Close'].values
+    # THE FIX: .flatten() squashes the 2D array into a simple 1D list of numbers
+    prices = df['Close'].values.flatten() 
     timestamps = df.index
     
-    # Pull Risk Rules directly from engine.py
     risk_rules = risk_management(CAPITAL)
     sl_pct = risk_rules['stop_loss_pct']   
     tp_pct = risk_rules['target_pct']      
@@ -32,9 +31,9 @@ def run_true_backtest(symbol="^NSEI", days=60, strategy="moderate"):
 
     print(f"Simulating live market for {strategy} strategy...")
     
-    # Loop through the data chronologically (The Time Machine)
     for i in range(50, len(prices)):
-        current_price = prices[i]
+        # THE FIX: Force the price to be a standard Python float
+        current_price = float(prices[i]) 
         current_time = timestamps[i]
 
         # --- STATE 1: HOLDING A POSITION ---
@@ -78,10 +77,8 @@ def run_true_backtest(symbol="^NSEI", days=60, strategy="moderate"):
             continue 
 
         # --- STATE 2: LOOKING FOR A TRADE ---
-        # Feed the historical slice up to the current minute to the engine
         price_slice = prices[:i+1]
         
-        # Pass current_time to the engine so it knows when to stop trading
         signal_data = calculate_signals(price_slice, current_time=current_time, strategy_name=strategy)
         
         if signal_data['action'] in ["BUY", "SELL"]:
