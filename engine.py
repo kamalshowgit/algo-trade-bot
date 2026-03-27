@@ -5,10 +5,9 @@ import numpy as np
 def get_base_df(price_list):
     """Processes technical indicators for all strategies"""
     
-    # 1. OPTIMIZATION: Only process the last 100 rows. 
-    # This prevents the CPU from grinding to a halt when the array gets huge.
-    if len(price_list) > 100:
-        price_list = price_list[-100:]
+    # 1. EXPANDED WINDOW: Increased to 300 to allow the 200 MA to calculate
+    if len(price_list) > 300:
+        price_list = price_list[-300:]
         
     df = pd.DataFrame(price_list, columns=['price'])
     
@@ -16,6 +15,9 @@ def get_base_df(price_list):
     df['ma_20'] = df['price'].rolling(window=20).mean()
     df['std_20'] = df['price'].rolling(window=20).std()
     df['ma_50'] = df['price'].rolling(window=50).mean()
+    
+    # The Institutional Filter
+    df['ma_200'] = df['price'].rolling(window=200).mean()
     
     # RSI Calculation
     delta = df['price'].diff()
@@ -55,30 +57,35 @@ def strategy_scalper(current):
 # --- STRATEGY 3: MODERATE INTRADAY (The "Active Trader") ---
 def strategy_moderate(current, current_time=None):
     """
-    Designed for 5-minute charts to yield 2-3 trades per day.
-    Uses Trend-Aligned Mean Reversion.
+    Yields highly filtered, realistic intraday trades.
+    Uses 200 MA for macro-trend alignment and RSI 35/65 for exhaustion.
     """
-    # 2. TIME FILTER: Avoid taking new trades after 3:00 PM (15:00)
     if current_time is not None:
+        # Avoid morning volatility and afternoon square-off risks
+        if current_time.hour == 9 and current_time.minute < 30:
+            return "WAIT"
         if current_time.hour >= 15:
             return "WAIT"
 
     upper = current['ma_20'] + (current['std_20'] * 2)
     lower = current['ma_20'] - (current['std_20'] * 2)
     
-    is_uptrend = current['ma_20'] > current['ma_50']
-    is_downtrend = current['ma_20'] < current['ma_50']
+    # 2. MACRO TREND FILTER: Price must respect the 200 MA hierarchy
+    is_uptrend = (current['ma_20'] > current['ma_50']) and (current['ma_50'] > current['ma_200'])
+    is_downtrend = (current['ma_20'] < current['ma_50']) and (current['ma_50'] < current['ma_200'])
     
-    if is_uptrend and (current['price'] <= lower) and (current['rsi'] <= 45):
+    # 3. STRICT PULLBACK: Ensures the dip is actually overextended
+    if is_uptrend and (current['price'] <= lower) and (current['rsi'] <= 35):
         return "BUY"
-    elif is_downtrend and (current['price'] >= upper) and (current['rsi'] >= 55):
+    elif is_downtrend and (current['price'] >= upper) and (current['rsi'] >= 65):
         return "SELL"
         
     return "WAIT"
 
 # --- MAIN DISPATCHER ---
 def calculate_signals(price_list, current_time=None, strategy_name="moderate"):
-    if len(price_list) < 50:
+    # Require enough data for the 200 MA to initialize
+    if len(price_list) < 200:
         return {"action": "WAIT", "rsi": 50, "ma": 0}
     
     df = get_base_df(price_list)
@@ -103,11 +110,9 @@ def calculate_signals(price_list, current_time=None, strategy_name="moderate"):
     }
 
 def risk_management(capital):
-    # 3. REALISTIC INTRADAY RISK
-    # On a 23,000 Nifty: 0.13% is ~30 points. 0.065% is ~15 points.
     return {
         "position_size": capital,
-        "stop_loss_pct": 0.00065, # Tight Intraday Stop (Protects Capital)
-        "target_pct": 0.0013,     # Realistic 5-minute target (Easily hits Rs 50+ net)
-        "brokerage_fee": 120      # Fully loaded 2026 costs
+        "stop_loss_pct": 0.0015,  # ~35 points: Escapes 5-minute market noise
+        "target_pct": 0.0030,     # ~70 points: 1:2 Risk/Reward ratio
+        "brokerage_fee": 120      
     }
