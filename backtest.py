@@ -1,109 +1,121 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from engine import calculate_signals, risk_management
 
-# --- SETTINGS ---
-LOT_SIZE = 65  
-CAPITAL = 100000
+# --- SCALABLE FRAMEWORK SETTINGS ---
+SYMBOL = "^NSEI" 
+DAYS = 59
+INTERVAL = "5m"
 
-def run_true_backtest(symbol="^NSEI", days=60, strategy="moderate"):
-    print(f"Fetching {days} days of 5-minute data for {symbol}...")
-    df = yf.download(symbol, period=f"{days}d", interval="5m")
+def run_pure_harness():
+    print(f"--- 🛠️ STARTING PURE LOGIC HARNESS: {SYMBOL} ---")
     
-    if df.empty:
-        print("Failed to fetch data.")
-        return
+    # 1. FETCH DATA (Source of Truth)
+    df = yf.download(SYMBOL, period=f"{DAYS}d", interval=INTERVAL)
+    if df.empty: return
+    
+    # Cleanup for yfinance Multi-Index
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # THE FIX: .flatten() squashes the 2D array into a simple 1D list of numbers
-    prices = df['Close'].values.flatten() 
+    prices = df['Close'].values.flatten().tolist()
+    volumes = df['Volume'].values.flatten().tolist()
     timestamps = df.index
-    
-    risk_rules = risk_management(CAPITAL)
-    sl_pct = risk_rules['stop_loss_pct']   
-    tp_pct = risk_rules['target_pct']      
-    brokerage = risk_rules['brokerage_fee'] 
 
+    # 2. IMPORT PARAMETERS (Everything from Engine)
+    # No hardcoding here; we trust engine.py for these numbers
+    params = risk_management() 
+    CAPITAL = params['position_size']
+    LOT_SIZE = 50 # Nifty Lot constant
+    
     trades = []
     in_position = False
+    pos_type = ""
     entry_price = 0.0
-    position_type = ""
     entry_time = None
+    daily_pnl = 0
+    current_day = None
 
-    print(f"Simulating live market for {strategy} strategy...")
-    
-    for i in range(50, len(prices)):
-        # THE FIX: Force the price to be a standard Python float
-        current_price = float(prices[i]) 
-        current_time = timestamps[i]
+    print(f"🚀 Running Framework with ₹{CAPITAL} Capital...")
 
-        # --- STATE 1: HOLDING A POSITION ---
+    # 3. THE EXECUTION LOOP
+    for i in range(70, len(prices)):
+        now_price = float(prices[i])
+        now_time = timestamps[i]
+        
+        # Reset Daily PnL tracker for Circuit Breaker logic
+        if current_day != now_time.date():
+            current_day = now_time.date()
+            daily_pnl = 0
+
+        # --- LOGIC LAYER 1: EXIT MANAGEMENT ---
         if in_position:
-            exit_triggered = False
-            reason = ""
+            # We call the engine to see if an EXIT signal is generated
+            # or if we need to square off for the day
+            signal_data = calculate_signals(
+                price_list=prices[i-65:i+1],
+                volume_list=volumes[i-65:i+1],
+                current_pnl=daily_pnl,
+                capital=CAPITAL,
+                current_time=now_time
+            )
             
-            # Intraday Hard Exit at 3:15 PM (15:15)
-            if current_time.hour == 15 and current_time.minute >= 15:
-                exit_triggered, reason = True, "Time Square-Off (3:15 PM)"
+            exit_signal = signal_data['action']
             
-            # Check Target and Stop Loss conditions
-            elif position_type == "BUY":
-                if current_price >= entry_price * (1 + tp_pct):
-                    exit_triggered, reason = True, "Target Hit"
-                elif current_price <= entry_price * (1 - sl_pct):
-                    exit_triggered, reason = True, "Stop Loss Hit"
-                    
-            elif position_type == "SELL":
-                if current_price <= entry_price * (1 - tp_pct):
-                    exit_triggered, reason = True, "Target Hit"
-                elif current_price >= entry_price * (1 + sl_pct):
-                    exit_triggered, reason = True, "Stop Loss Hit"
+            # Check for Target/Stop Loss using Engine's percentages
+            is_sl = (pos_type == "LONG" and now_price <= entry_price * (1 - params['stop_loss_pct'])) or \
+                    (pos_type == "SHORT" and now_price >= entry_price * (1 + params['stop_loss_pct']))
+            
+            is_tp = (pos_type == "LONG" and now_price >= entry_price * (1 + params['target_pct'])) or \
+                    (pos_type == "SHORT" and now_price <= entry_price * (1 - params['target_pct']))
 
-            if exit_triggered:
-                points = (current_price - entry_price) if position_type == "BUY" else (entry_price - current_price)
-                gross_pnl = points * LOT_SIZE
-                net_pnl = gross_pnl - brokerage
+            # Logic-based exit or Risk-based exit
+            if exit_signal in ["EXIT_LONG", "EXIT_SHORT", "STOP_FOR_DAY"] or is_sl or is_tp:
+                # Use the engine's "Price" which already includes SLIPPAGE
+                exit_price = signal_data['price'] 
+                
+                points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
+                net_pnl = (points * LOT_SIZE) - params['brokerage_fee']
+                daily_pnl += net_pnl
                 
                 trades.append({
-                    "Entry Time": entry_time,
-                    "Exit Time": current_time,
-                    "Type": position_type,
-                    "Entry Price": round(entry_price, 2),
-                    "Exit Price": round(current_price, 2),
-                    "Points": round(points, 2),
-                    "Net PnL": round(net_pnl, 2),
-                    "Reason": reason
+                    "Time": now_time,
+                    "Type": pos_type,
+                    "Entry": round(entry_price, 2),
+                    "Exit": round(exit_price, 2),
+                    "Net_PnL": round(net_pnl, 2),
+                    "Condition": exit_signal if "EXIT" in exit_signal else "Risk/Target"
                 })
-                in_position = False 
-            continue 
+                in_position = False
+            continue
 
-        # --- STATE 2: LOOKING FOR A TRADE ---
-        price_slice = prices[:i+1]
-        
-        signal_data = calculate_signals(price_slice, current_time=current_time, strategy_name=strategy)
-        
-        if signal_data['action'] in ["BUY", "SELL"]:
+        # --- LOGIC LAYER 2: ENTRY SEARCH ---
+        # Direct call to engine.py
+        signal_data = calculate_signals(
+            price_list=prices[i-65:i+1],
+            volume_list=volumes[i-65:i+1],
+            current_pnl=daily_pnl,
+            capital=CAPITAL,
+            current_time=now_time
+        )
+
+        if signal_data['action'] in ["BUY_LONG", "SELL_SHORT"]:
             in_position = True
-            position_type = signal_data['action']
-            entry_price = current_price
-            entry_time = current_time
+            pos_type = "LONG" if "BUY" in signal_data['action'] else "SHORT"
+            entry_price = signal_data['price'] # Engine handles the slippage on entry
+            entry_time = now_time
 
-    # --- COMPILE RESULTS ---
-    results_df = pd.DataFrame(trades)
-    if results_df.empty:
-        print(f"No trades triggered by {strategy} in the last {days} days.")
-        return
-
-    csv_name = f"{strategy}_backtest.csv"
-    results_df.to_csv(csv_name, index=False)
-    
-    win_rate = (results_df['Net PnL'] > 0).mean() * 100
-    total_pnl = results_df['Net PnL'].sum()
-    
-    print("\n--- BACKTEST RESULTS ---")
-    print(f"Total Trades: {len(results_df)}")
-    print(f"Win Rate: {win_rate:.2f}%")
-    print(f"Total Net PnL: ₹{total_pnl:,.2f}")
-    print(f"✅ Trade log saved to: {csv_name}")
+    # 4. REPORTING
+    if trades:
+        res_df = pd.DataFrame(trades)
+        print("\n" + "="*40)
+        print(f"FINAL AUDIT: ₹{res_df['Net_PnL'].sum():,.2f} Total PnL")
+        print(f"Trade Count: {len(res_df)} | Win Rate: {(res_df['Net_PnL']>0).mean()*100:.1f}%")
+        print("="*40)
+        res_df.to_csv("framework_results.csv", index=False)
+    else:
+        print("❌ No trades matched the engine logic in this period.")
 
 if __name__ == "__main__":
-    run_true_backtest(strategy="moderate")
+    run_pure_harness()
