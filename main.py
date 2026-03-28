@@ -25,7 +25,7 @@ from config import API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET
 # CONFIG  —  NIFTY FUTURES SETTINGS
 # ===========================================================================
 CAPITAL          = 100000        # Capital ₹1 Lakh
-LOT_SIZE         = 50            # Standard Nifty Lot Size [F3]
+LOT_SIZE         = 65            # Standard Nifty Lot Size [F3]
 BROKERAGE        = 60            # ₹ per round-trip (Matches engine 7.0)
 ACTIVE_STRATEGY  = "moderate"    
 SYMBOL           = "NIFTY30APR26FUT"
