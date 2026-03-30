@@ -1,7 +1,7 @@
 """
 FILE: engine.py
 AUTHOR: Kamal Soni
-VERSION: 8.0 (Nifty-F&O Optimized)
+VERSION: 8.1 (Nifty-F&O Optimized + EOD Exit)
 """
 import pandas as pd
 import numpy as np
@@ -13,7 +13,7 @@ def get_base_df(price_list, volume_list=None):
     if volume_list and len(volume_list) == len(price_list):
         df['volume'] = volume_list
     else:
-        df['volume'] = 1.0 # Fallback only if API fails
+        df['volume'] = 1.0 
         
     df['vol_ma'] = df['volume'].rolling(window=20).mean()
     
@@ -21,12 +21,12 @@ def get_base_df(price_list, volume_list=None):
     df['ema_9']  = df['price'].ewm(span=9,  adjust=False).mean()
     df['ema_21'] = df['price'].ewm(span=21, adjust=False).mean()
     
-    # --- WILDER'S RSI (The Nifty Standard) ---
+    # --- WILDER'S RSI (Industry Standard) ---
     delta = df['price'].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     
-    # Wilder's uses alpha = 1/period
+    # Wilder's smoothing alpha = 1/N
     avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     
@@ -37,31 +37,36 @@ def get_base_df(price_list, volume_list=None):
 def strategy_moderate(current, current_time=None):
     """
     Nifty F&O High-Yield Strategy
-    Logic: EMA Pullback + RSI Confirmation
+    Logic: EMA Pullback + RSI Confirmation + EOD Exit
     """
-    # 1. Trend Definition
+    if not current_time:
+        return "WAIT"
+        
+    now_m = current_time.hour * 60 + current_time.minute
+    
+    # --- 1. EOD FORCE EXIT (3:15 PM onwards) ---
+    # Beating the broker's 3:20 PM auto-square-off cutoff
+    if now_m >= (15 * 60 + 15):
+        return "EXIT_ALL"
+
+    # --- 2. TIMING GUARD (Early Morning Volatility) ---
+    if now_m < (9 * 60 + 20):
+        return "WAIT"
+
+    # Trend Definition
     is_uptrend   = (current['ema_9'] > current['ema_21'])
     is_downtrend = (current['ema_9'] < current['ema_21'])
     
-    # 2. Timing Guard (9:20 AM - 3:15 PM)
-    if current_time:
-        now_m = current_time.hour * 60 + current_time.minute
-        if now_m < (9 * 60 + 20) or now_m > (15 * 60 + 15):
-            return "WAIT"
-
-    # --- LONG ENTRY (Buy the Dip) ---
+    # --- 3. ENTRY LOGIC ---
     if is_uptrend:
-        # Price within 0.1% of EMA-9 and RSI shows strength (>45)
         if (current['price'] <= current['ema_9'] * 1.001) and current['rsi'] > 45:
             return "BUY_LONG"
             
-    # --- SHORT ENTRY (Sell the Rip) ---
     elif is_downtrend:
-        # Price within 0.1% of EMA-9 bounce and RSI shows weakness (<55)
         if (current['price'] >= current['ema_9'] * 0.999) and current['rsi'] < 55:
             return "SELL_SHORT"
 
-    # --- TECHNICAL EXITS ---
+    # --- 4. TECHNICAL EXITS (Counter-Trend Moves) ---
     if is_downtrend and current['rsi'] > 65: return "EXIT_LONG"
     if is_uptrend and current['rsi'] < 35: return "EXIT_SHORT"
     
@@ -71,18 +76,18 @@ def risk_management(capital=None):
     cap = capital if capital else 100000
     return {
         "position_size": cap,
-        "stop_loss_pct": 0.0020,  # 0.2% (~45 Nifty Points)
-        "target_pct": 0.0050,     # 0.5% (~110 Nifty Points)
-        "brokerage_fee": 60,      # Flat fee for Nifty Futures
-        "daily_loss_limit": cap * 0.015 # 1.5% Circuit Breaker
+        "stop_loss_pct": 0.0020,  # 0.2% SL
+        "target_pct": 0.0050,     # 0.5% Target
+        "brokerage_fee": 60,      
+        "daily_loss_limit": cap * 0.015 # ₹1,500 hard stop
     }
 
 def calculate_signals(price_list, volume_list=None, current_pnl=0, capital=None, current_time=None, strategy_name="moderate"):
-    # Guard against insufficient data for EMA-21
+    # Guard against insufficient data for EMA calculations
     if len(price_list) < 25: 
         return {"action": "WAIT", "price": 0, "rsi": 50, "ma": 0}
     
-    # Portfolio Circuit Breaker
+    # Check Daily P&L Circuit Breaker
     risk = risk_management(capital)
     if current_pnl <= -risk['daily_loss_limit']:
         return {"action": "STOP_FOR_DAY", "price": 0, "rsi": 50, "ma": 0}

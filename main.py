@@ -1,12 +1,12 @@
 """
 FILE: main.py
 AUTHOR: Kamal Soni (Quant Research)
-VERSION: 7.0 "Final Production Sync"
+VERSION: 8.0 "Production Ready - Nifty F&O"
 
-FIXES:
-  - Fixed duplicate _write_log method (Resolved KeyError)
-  - Unified RSI logging key mapping
-  - Standardized Signal Dispatcher for Bi-Directional trading
+CHANGES:
+  - Added EXIT_ALL dispatcher for EOD Square-off (3:15 PM)
+  - Fixed duplicate logging methods (Resolved KeyError)
+  - Synchronized LOT_SIZE to 65 (Nifty April 2026 contract)
 """
 
 import time
@@ -26,11 +26,11 @@ from config import API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET
 # ===========================================================================
 CAPITAL          = 100000        # Capital ₹1 Lakh
 LOT_SIZE         = 65            # Nifty April 2026 Lot Size
-BROKERAGE        = 60            # ₹ per round-trip (Matches engine 7.0)
+BROKERAGE        = 60            # ₹ per round-trip
 ACTIVE_STRATEGY  = "moderate"    
 SYMBOL           = "NIFTY30APR26FUT"
-TOKEN            = "35000"       # Verify this Token for April Futures
-EXCHANGE_SEG     = "NFO"         # MUST be NFO for Futures
+TOKEN            = "35000"       # April Future Token ID
+EXCHANGE_SEG     = "NFO"         # Derivatives Exchange
 HISTORY_SIZE     = 200           
 TICK_SLEEP       = 1             
 MAX_ERRORS       = 5             
@@ -54,7 +54,6 @@ class PaperTrader:
         self.entry_price = 0.0
         self.total_pnl   = 0.0
 
-        # Initialize Trade Log
         if not os.path.exists(TRADE_LOG_FILE):
             with open(TRADE_LOG_FILE, 'w', newline='') as f:
                 csv.writer(f).writerow([
@@ -62,7 +61,6 @@ class PaperTrader:
                     "Trade_PnL", "Total_PnL", "RSI_Value",
                 ])
 
-        # Initialize Signal Log
         if not os.path.exists(SIGNAL_LOG_FILE):
             with open(SIGNAL_LOG_FILE, 'w', newline='') as f:
                 csv.writer(f).writerow([
@@ -71,14 +69,13 @@ class PaperTrader:
                 ])
 
     def _write_log(self, ts, strat, side, price, qty, pnl, data):
-        """Unified logging to prevent KeyErrors in analysis scripts."""
-        # Check all possible RSI keys from the engine
-        rsi_to_log = data.get('rsi') if data.get('rsi') is not None else data.get('RSI_Value', 0)
+        """Standardized logging to match performance audit script."""
+        rsi_val = data.get('rsi') if data.get('rsi') is not None else data.get('RSI_Value', 0)
         
         with open(TRADE_LOG_FILE, 'a', newline='') as f:
             csv.writer(f).writerow([
                 ts, strat, side, price, qty, 
-                round(pnl, 2), round(self.total_pnl, 2), rsi_to_log
+                round(pnl, 2), round(self.total_pnl, 2), rsi_val
             ])
 
     def execute_paper_trade(self, side, strategy_used, engine_data):
@@ -90,32 +87,23 @@ class PaperTrader:
         if side == "BUY_LONG" and self.position == 0:
             self.entry_price = price
             self.position    = LOT_SIZE
-            log_side         = "BUY"
+            self._write_log(timestamp, strategy_used, "BUY", price, LOT_SIZE, 0, engine_data)
             print(f"📝 [LONG ENTRY]  ₹{price} | RSI: {engine_data.get('rsi')}")
 
         elif side == "SELL_SHORT" and self.position == 0:
             self.entry_price = price
             self.position    = -LOT_SIZE
-            log_side         = "SELL"
+            self._write_log(timestamp, strategy_used, "SELL", price, LOT_SIZE, 0, engine_data)
             print(f"🔻 [SHORT ENTRY] ₹{price} | RSI: {engine_data.get('rsi')}")
 
         # --- EXIT LOGIC ---
         elif side == "EXIT_LONG" and self.position > 0:
             trade_pnl = (price - self.entry_price) * LOT_SIZE
-            log_side  = "SELL"
-            self._finalize_trade(trade_pnl, price, log_side, strategy_used, engine_data)
-            return
+            self._finalize_trade(trade_pnl, price, "SELL", strategy_used, engine_data)
 
         elif side == "EXIT_SHORT" and self.position < 0:
             trade_pnl = (self.entry_price - price) * LOT_SIZE 
-            log_side  = "BUY"
-            self._finalize_trade(trade_pnl, price, log_side, strategy_used, engine_data)
-            return
-        else:
-            return
-
-        # Log Entry Row
-        self._write_log(timestamp, strategy_used, log_side, price, LOT_SIZE, 0, engine_data)
+            self._finalize_trade(trade_pnl, price, "BUY", strategy_used, engine_data)
 
     def _finalize_trade(self, trade_pnl, price, side, strategy, engine_data):
         net_pnl = trade_pnl - BROKERAGE
@@ -127,7 +115,6 @@ class PaperTrader:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
             strategy, side, price, LOT_SIZE, trade_pnl, engine_data
         )
-        # Reset state AFTER logging
         self.position = 0
         self.entry_price = 0
 
@@ -160,7 +147,7 @@ def run_bot():
     history    = deque(maxlen=HISTORY_SIZE)
     api_errors = 0
 
-    print(f"📊 Running {ACTIVE_STRATEGY.upper()} Strategy...")
+    print(f"📊 Tracking {SYMBOL} | Strategy: {ACTIVE_STRATEGY.upper()}")
 
     while True:
         try:
@@ -191,22 +178,27 @@ def run_bot():
                     print(f"🚨 Daily Loss Limit Reached.")
                     break
 
-                # SIGNAL DISPATCHER
+                # --- SIGNAL DISPATCHER ---
                 if signal == "BUY_LONG" and bot.position == 0:
-                    bot.execute_paper_trade("BUY_LONG",  ACTIVE_STRATEGY, engine_data)
+                    bot.execute_paper_trade("BUY_LONG", ACTIVE_STRATEGY, engine_data)
                 elif signal == "SELL_SHORT" and bot.position == 0:
                     bot.execute_paper_trade("SELL_SHORT", ACTIVE_STRATEGY, engine_data)
                 elif signal == "EXIT_LONG" and bot.position > 0:
                     bot.execute_paper_trade("EXIT_LONG", ACTIVE_STRATEGY, engine_data)
                 elif signal == "EXIT_SHORT" and bot.position < 0:
                     bot.execute_paper_trade("EXIT_SHORT", ACTIVE_STRATEGY, engine_data)
+                
+                # Handle Force EOD Exit from Engine
+                elif signal == "EXIT_ALL" and bot.position != 0:
+                    exit_side = "EXIT_LONG" if bot.position > 0 else "EXIT_SHORT"
+                    bot.execute_paper_trade(exit_side, ACTIVE_STRATEGY, engine_data)
 
             time.sleep(TICK_SLEEP)
 
         except Exception as e:
             api_errors += 1
             if api_errors >= MAX_ERRORS:
-                print("🔄 Attempting Reconnect...")
+                print("🔄 Reconnecting...")
                 try:
                     api = create_session()
                     api_errors = 0
