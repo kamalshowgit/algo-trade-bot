@@ -1,12 +1,12 @@
 """
 FILE: main.py
 AUTHOR: Kamal Soni (Quant Research)
-VERSION: 6.0 "Live Futures Sync"
+VERSION: 7.0 "Final Production Sync"
 
-COMPATIBILITY:
-  - Supports Bi-Directional (Long/Short) trading
-  - Fixed for NFO (Nifty Futures) Segment
-  - Column parity with review_performance.py
+FIXES:
+  - Fixed duplicate _write_log method (Resolved KeyError)
+  - Unified RSI logging key mapping
+  - Standardized Signal Dispatcher for Bi-Directional trading
 """
 
 import time
@@ -25,12 +25,12 @@ from config import API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET
 # CONFIG  —  NIFTY FUTURES SETTINGS
 # ===========================================================================
 CAPITAL          = 100000        # Capital ₹1 Lakh
-LOT_SIZE         = 65            # Standard Nifty Lot Size [F3]
+LOT_SIZE         = 65            # Nifty April 2026 Lot Size
 BROKERAGE        = 60            # ₹ per round-trip (Matches engine 7.0)
 ACTIVE_STRATEGY  = "moderate"    
 SYMBOL           = "NIFTY30APR26FUT"
 TOKEN            = "35000"       # Verify this Token for April Futures
-EXCHANGE_SEG     = "NFO"         # MUST be NFO for Futures [F1]
+EXCHANGE_SEG     = "NFO"         # MUST be NFO for Futures
 HISTORY_SIZE     = 200           
 TICK_SLEEP       = 1             
 MAX_ERRORS       = 5             
@@ -50,10 +50,11 @@ def create_session():
 class PaperTrader:
     def __init__(self, initial_capital):
         self.capital     = initial_capital
-        self.position    = 0        # +50 for Long, -50 for Short
+        self.position    = 0        # +65 for Long, -65 for Short
         self.entry_price = 0.0
         self.total_pnl   = 0.0
 
+        # Initialize Trade Log
         if not os.path.exists(TRADE_LOG_FILE):
             with open(TRADE_LOG_FILE, 'w', newline='') as f:
                 csv.writer(f).writerow([
@@ -61,12 +62,24 @@ class PaperTrader:
                     "Trade_PnL", "Total_PnL", "RSI_Value",
                 ])
 
+        # Initialize Signal Log
         if not os.path.exists(SIGNAL_LOG_FILE):
             with open(SIGNAL_LOG_FILE, 'w', newline='') as f:
                 csv.writer(f).writerow([
                     "Timestamp", "Strategy", "Signal", "LTP",
                     "RSI_Value", "MA_20", "BB_Upper", "BB_Lower", "Position",
                 ])
+
+    def _write_log(self, ts, strat, side, price, qty, pnl, data):
+        """Unified logging to prevent KeyErrors in analysis scripts."""
+        # Check all possible RSI keys from the engine
+        rsi_to_log = data.get('rsi') if data.get('rsi') is not None else data.get('RSI_Value', 0)
+        
+        with open(TRADE_LOG_FILE, 'a', newline='') as f:
+            csv.writer(f).writerow([
+                ts, strat, side, price, qty, 
+                round(pnl, 2), round(self.total_pnl, 2), rsi_to_log
+            ])
 
     def execute_paper_trade(self, side, strategy_used, engine_data):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -83,7 +96,7 @@ class PaperTrader:
         elif side == "SELL_SHORT" and self.position == 0:
             self.entry_price = price
             self.position    = -LOT_SIZE
-            log_side         = "SELL" # Logged as SELL to initiate short
+            log_side         = "SELL"
             print(f"🔻 [SHORT ENTRY] ₹{price} | RSI: {engine_data.get('rsi')}")
 
         # --- EXIT LOGIC ---
@@ -91,30 +104,32 @@ class PaperTrader:
             trade_pnl = (price - self.entry_price) * LOT_SIZE
             log_side  = "SELL"
             self._finalize_trade(trade_pnl, price, log_side, strategy_used, engine_data)
+            return
 
         elif side == "EXIT_SHORT" and self.position < 0:
-            trade_pnl = (self.entry_price - price) * LOT_SIZE # Profit if price falls
+            trade_pnl = (self.entry_price - price) * LOT_SIZE 
             log_side  = "BUY"
             self._finalize_trade(trade_pnl, price, log_side, strategy_used, engine_data)
+            return
         else:
             return
 
-        # Log Entry Row (Exits handled by _finalize_trade)
-        if "EXIT" not in side:
-            self._write_log(timestamp, strategy_used, log_side, price, LOT_SIZE, 0, engine_data)
+        # Log Entry Row
+        self._write_log(timestamp, strategy_used, log_side, price, LOT_SIZE, 0, engine_data)
 
     def _finalize_trade(self, trade_pnl, price, side, strategy, engine_data):
         net_pnl = trade_pnl - BROKERAGE
         self.total_pnl += net_pnl
         self.capital   += net_pnl
-        self.position   = 0
-        self.entry_price = 0
         print(f"💰 [EXIT] Net: ₹{net_pnl:.2f} | Total P&L: ₹{self.total_pnl:.2f}")
-        self._write_log(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), strategy, side, price, LOT_SIZE, trade_pnl, engine_data)
-
-    def _write_log(self, ts, strat, side, price, qty, pnl, data):
-        with open(TRADE_LOG_FILE, 'a', newline='') as f:
-            csv.writer(f).writerow([ts, strat, side, price, qty, round(pnl, 2), round(self.total_pnl, 2), data.get('rsi', 0)])
+        
+        self._write_log(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            strategy, side, price, LOT_SIZE, trade_pnl, engine_data
+        )
+        # Reset state AFTER logging
+        self.position = 0
+        self.entry_price = 0
 
     def log_signal(self, strategy_used, engine_data, ltp):
         with open(SIGNAL_LOG_FILE, 'a', newline='') as f:
@@ -136,7 +151,7 @@ def run_bot():
 
     try:
         api = create_session()
-        print(f"✅ Session Active | {SYMBOL} ({EXCHANGE_SEG})")
+        print(f"✅ SESSION ACTIVE | {SYMBOL} ({EXCHANGE_SEG})")
     except Exception as e:
         print(f"❌ Login Failed: {e}")
         return
@@ -145,13 +160,15 @@ def run_bot():
     history    = deque(maxlen=HISTORY_SIZE)
     api_errors = 0
 
+    print(f"📊 Running {ACTIVE_STRATEGY.upper()} Strategy...")
+
     while True:
         try:
             current_time = datetime.now()
             if current_time > market_close:
+                print(f"🏁 Session ended at {current_time.strftime('%H:%M:%S')}")
                 break
 
-            # Fetch LTP from NFO Segment
             res = api.ltpData(EXCHANGE_SEG, SYMBOL, TOKEN)
 
             if res.get('status') is True:
@@ -171,10 +188,10 @@ def run_bot():
                 bot.log_signal(ACTIVE_STRATEGY, engine_data, ltp)
 
                 if signal == "STOP_FOR_DAY":
-                    print(f"🚨 CIRCUIT BREAKER HIT.")
+                    print(f"🚨 Daily Loss Limit Reached.")
                     break
 
-                # --- DISPATCH SIGNALS ---
+                # SIGNAL DISPATCHER
                 if signal == "BUY_LONG" and bot.position == 0:
                     bot.execute_paper_trade("BUY_LONG",  ACTIVE_STRATEGY, engine_data)
                 elif signal == "SELL_SHORT" and bot.position == 0:
@@ -189,8 +206,11 @@ def run_bot():
         except Exception as e:
             api_errors += 1
             if api_errors >= MAX_ERRORS:
-                api = create_session()
-                api_errors = 0
+                print("🔄 Attempting Reconnect...")
+                try:
+                    api = create_session()
+                    api_errors = 0
+                except: pass
             time.sleep(2)
 
 
