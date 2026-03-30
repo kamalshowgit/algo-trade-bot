@@ -18,7 +18,7 @@ from datetime import datetime
 
 import engine
 from SmartApi import SmartConnect
-from config import API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET
+from test_connection import API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET
 
 
 # ===========================================================================

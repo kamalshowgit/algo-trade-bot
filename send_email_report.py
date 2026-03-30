@@ -10,7 +10,7 @@ import os
 
 # --- CONFIG ---
 SENDER_EMAIL = "kamalsoni3839@gmail.com"
-RECEIVER_EMAIL = "kamalsoni3839@gmail.com"
+RECEIVER_EMAIL = ["kamalsoni3839@gmail.com", "Jinalsoni3581@gmail.com"]
 APP_PASSWORD = "jhnb bqup hihq ebzd" # The one you just generated
 CSV_FILE_PATH = "/home/ubuntu/trading_bot/paper_trade_history.csv"
 
