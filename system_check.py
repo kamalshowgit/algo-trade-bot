@@ -17,8 +17,8 @@ def run_diagnostic():
     # 2. Test Engine Logic
     print("🧪 Testing Strategy Dispatcher...")
     try:
-        sig_sniper = engine.calculate_signals(mock_prices, strategy_name="sniper")
-        sig_scalper = engine.calculate_signals(mock_prices, strategy_name="scalper")
+        sig_sniper = engine.calculate_signals(mock_prices, current_time=datetime.now())
+        sig_scalper = engine.calculate_signals(mock_prices, current_time=datetime.now())
         print(f"   [Sniper Signal]: {sig_sniper}")
         print(f"   [Scalper Signal]: {sig_scalper}")
         print("✅ Engine Logic: PASS")

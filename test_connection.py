@@ -1,11 +1,15 @@
 import pyotp
 from SmartApi import SmartConnect
+import os
+from dotenv import load_dotenv
 
-# CONFIGURATION - Replace with your actual Angel One details
-API_KEY = "D8LSmLpD"
-CLIENT_ID = "K114092"
-PASSWORD = "5389"
-TOTP_SECRET = "HRJVN7JF2YTGXVTXNGHOCYNM4A" # The string you used for Google Authenticator
+load_dotenv()
+
+# CONFIGURATION - Now loaded from .env
+API_KEY = os.getenv("ANGEL_API_KEY")
+CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
+PASSWORD = os.getenv("ANGEL_PASSWORD")
+TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 
 def test_login():
     try:
