@@ -60,6 +60,7 @@ def run_live_trading():
         return
     
     print("✅ Angel One login successful")
+    print("📡 Waiting for market open...")
     
     trades = []
     price_history = []
@@ -97,6 +98,7 @@ def run_live_trading():
         
         # Only trade during market hours
         if not (555 <= now_m <= 915):  # 9:15 AM to 3:15 PM
+            print(f"⏰ Outside market hours ({now.strftime('%H:%M')}). Waiting...")
             time.sleep(60)  # Wait 1 minute before checking again
             continue
         
