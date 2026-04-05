@@ -17,7 +17,7 @@ CONFIG = {
     "CAPITAL": 100000,
     "SLIPPAGE_BPS": 0.0004,
     "OUTPUT_FILE": "angel_backtest_results.csv",
-    "LIVE_MODE": False  # Set to True for live trading
+    "LIVE_MODE": os.getenv("LIVE_MODE", "False").lower() == "true"  # Read from env var
 }
 
 # Angel One credentials
@@ -148,9 +148,11 @@ def run_live_trading():
                 
                 # Place live order
                 side = "BUY" if pos_type == "LONG" else "SELL"
-                order_response = place_order(smart_api, "NIFTY26FEB25600CE", side, CONFIG['LOT_SIZE'], entry_price)
+                # Use NIFTY futures contract - adjust symbol as needed
+                symbol = "NIFTY30APR26FUT"  # Current NIFTY futures
+                order_response = place_order(smart_api, symbol, side, CONFIG['LOT_SIZE'], entry_price)
                 if order_response:
-                    print(f"✅ Placed {side} order at {entry_price}")
+                    print(f"✅ Placed {side} order for {symbol} at {entry_price}")
                 else:
                     print("❌ Order placement failed")
             
@@ -178,9 +180,10 @@ def run_live_trading():
                 
                 # Place exit order
                 exit_side = "SELL" if pos_type == "LONG" else "BUY"
-                exit_order = place_order(smart_api, "NIFTY26FEB25600CE", exit_side, CONFIG['LOT_SIZE'], exit_price)
+                symbol = "NIFTY30APR26FUT"  # Same symbol for exit
+                exit_order = place_order(smart_api, symbol, exit_side, CONFIG['LOT_SIZE'], exit_price)
                 if exit_order:
-                    print(f"✅ Placed {exit_side} exit order at {exit_price}")
+                    print(f"✅ Placed {exit_side} exit order for {symbol} at {exit_price}")
                 
                 in_position = False
             
