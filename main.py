@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import os
+import time
 from datetime import datetime, timedelta
 from engine import calculate_signals, risk_management
 from dotenv import load_dotenv
@@ -46,18 +47,152 @@ def place_order(smart_api, symbol, side, quantity, price):
         print(f"Order placement failed: {e}")
         return None
 
+def run_live_trading():
+    """Run live trading during market hours and exit after market close."""
+    print("🚀 Starting LIVE TRADING MODE")
+    
+    # Initialize API
+    smart_api = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    login_response = smart_api.generateSession(CLIENT_ID, PASSWORD, totp)
+    if not login_response['status']:
+        print("❌ Angel One login failed")
+        return
+    
+    print("✅ Angel One login successful")
+    
+    trades = []
+    price_history = []
+    in_position = False
+    pos_type, entry_price, entry_time = "", 0.0, None
+    daily_pnl = 0
+    entry_data = {}
+    
+    # Trading loop - runs until market close
+    while True:
+        now = datetime.now()
+        now_m = now.hour * 60 + now.minute
+        
+        # Market close check - send email and exit
+        if now_m >= 915:  # 3:15 PM IST
+            print("🏁 Market closed. Sending final report...")
+            
+            if trades:
+                report_df = pd.DataFrame(trades)
+                report_df.to_csv(CONFIG['OUTPUT_FILE'], index=False)
+                
+                price_history_df = pd.DataFrame(price_history)
+                price_history_df.to_csv("price_history.csv", index=False)
+                
+                # Send email report
+                try:
+                    from send_email_report import send_performance_email
+                    send_performance_email()
+                    print("✅ Email report sent")
+                except Exception as e:
+                    print(f"❌ Email failed: {e}")
+            
+            print("✅ Live trading session complete. Exiting...")
+            return  # Exit gracefully for PM2 restart tomorrow
+        
+        # Only trade during market hours
+        if not (555 <= now_m <= 915):  # 9:15 AM to 3:15 PM
+            time.sleep(60)  # Wait 1 minute before checking again
+            continue
+        
+        try:
+            # Fetch latest 5-minute data
+            end_time = now.replace(second=0, microsecond=0)
+            start_time = end_time - timedelta(hours=1)  # Get last hour of data
+            
+            df = yf.download(CONFIG['SYMBOL'], start=start_time, end=end_time, interval="5m")
+            if df.empty or len(df) < 2:
+                time.sleep(60)
+                continue
+            
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            current_price = float(df['Close'].iloc[-1])
+            current_time = df.index[-1].to_pydatetime()
+            
+            # Track price history
+            price_history.append({
+                "DateTime": current_time,
+                "Price": current_price,
+                "High": float(df['High'].iloc[-1]),
+                "Low": float(df['Low'].iloc[-1]),
+                "Volume": float(df['Volume'].iloc[-1]) if 'Volume' in df.columns else 0
+            })
+            
+            # Get price window for signals (last 26 candles = ~2 hours)
+            price_window = df['Close'].tail(26).tolist()
+            if len(price_window) < 20:
+                time.sleep(60)
+                continue
+            
+            # Generate signal
+            signal_data = calculate_signals(price_list=price_window, current_time=current_time, 
+                                          position=(1 if pos_type == "LONG" else -1) if in_position else 0, 
+                                          entry_price=entry_price)
+            
+            action = signal_data.get('action', 'WAIT')
+            
+            # Entry logic
+            if not in_position and action in ["BUY_LONG", "SELL_SHORT"]:
+                in_position = True
+                pos_type = "LONG" if "BUY" in action else "SHORT"
+                entry_price = current_price * (1 + (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
+                entry_time = current_time
+                entry_data = signal_data
+                
+                # Place live order
+                side = "BUY" if pos_type == "LONG" else "SELL"
+                order_response = place_order(smart_api, "NIFTY26FEB25600CE", side, CONFIG['LOT_SIZE'], entry_price)
+                if order_response:
+                    print(f"✅ Placed {side} order at {entry_price}")
+                else:
+                    print("❌ Order placement failed")
+            
+            # Exit logic
+            elif in_position and "EXIT" in action:
+                exit_price = current_price * (1 - (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
+                points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
+                net_pnl = (points * CONFIG['LOT_SIZE']) - risk_management()['brokerage_fee']
+                daily_pnl += net_pnl
+                
+                trades.append({
+                    "Trade_ID": f"ANGEL_{len(trades)+1}",
+                    "Entry_Time": entry_time,
+                    "Exit_Time": current_time,
+                    "Type": pos_type,
+                    "Entry_Price": round(entry_price, 2),
+                    "Exit_Price": round(exit_price, 2),
+                    "Points": round(points, 2),
+                    "Net_PnL": round(net_pnl, 2),
+                    "Exit_Reason": action,
+                    "Entry_RSI": entry_data.get('rsi'),
+                    "Entry_EMA_F": entry_data.get('ema_f'),
+                    "Exit_RSI": signal_data.get('rsi')
+                })
+                
+                # Place exit order
+                exit_side = "SELL" if pos_type == "LONG" else "BUY"
+                exit_order = place_order(smart_api, "NIFTY26FEB25600CE", exit_side, CONFIG['LOT_SIZE'], exit_price)
+                if exit_order:
+                    print(f"✅ Placed {exit_side} exit order at {exit_price}")
+                
+                in_position = False
+            
+            # Wait 5 minutes before next check
+            time.sleep(300)
+            
+        except Exception as e:
+            print(f"❌ Live trading error: {e}")
+            time.sleep(60)
+
 def run_angel_backtest():
-    # Initialize API if live mode
-    smart_api = None
-    if CONFIG['LIVE_MODE']:
-        smart_api = SmartConnect(api_key=API_KEY)
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        login_response = smart_api.generateSession(CLIENT_ID, PASSWORD, totp)
-        if login_response['status']:
-            print("✅ Angel One login successful")
-        else:
-            print("❌ Angel One login failed")
-            return
+    # ... existing backtest code ...
     # 1. Fetching valid 60-day window
     start_date = (datetime.now() - timedelta(days=58)).strftime('%Y-%m-%d')
     print(f"📡 Fetching data for {CONFIG['SYMBOL']} from {start_date}...")
@@ -170,4 +305,7 @@ def run_angel_backtest():
         print("\n❌ NO TRADES.")
 
 if __name__ == "__main__":
-    run_angel_backtest()
+    if CONFIG['LIVE_MODE']:
+        run_live_trading()
+    else:
+        run_angel_backtest()
