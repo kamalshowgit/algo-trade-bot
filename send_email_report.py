@@ -21,11 +21,11 @@ BACKTEST_RESULTS_PATH = "./angel_backtest_results.csv"
 def get_summary():
     """Reads trade data and generates a detailed summary with price information."""
     try:
-        # Read backtest results
-        if not os.path.exists(BACKTEST_RESULTS_PATH):
-            return "Error: Backtest results file not found.", False, None, None
+        trade_path = TRADE_DATA_PATH if os.path.exists(TRADE_DATA_PATH) else BACKTEST_RESULTS_PATH
+        if not os.path.exists(trade_path):
+            return "Error: Trade results file not found.", False, None, None
         
-        trades_df = pd.read_csv(BACKTEST_RESULTS_PATH)
+        trades_df = pd.read_csv(trade_path)
         
         if trades_df.empty:
             return "No trades executed today.", False, None, None
@@ -172,6 +172,8 @@ def send_email():
         print(f"✅ Email sent successfully to: {', '.join(RECEIVER_EMAIL)}")
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
+
+send_performance_email = send_email
 
 if __name__ == "__main__":
     send_email()

@@ -12,12 +12,15 @@ from SmartApi import SmartConnect
 load_dotenv()
 
 CONFIG = {
-    "SYMBOL": "^NSEI", 
+    "SYMBOL": "^NSEI",
     "LOT_SIZE": 50,
     "CAPITAL": 100000,
     "SLIPPAGE_BPS": 0.0004,
     "OUTPUT_FILE": "angel_backtest_results.csv",
-    "LIVE_MODE": os.getenv("LIVE_MODE", "False").lower() == "true"  # Read from env var
+    "PAPER_OUTPUT_FILE": os.getenv("PAPER_OUTPUT_FILE", "paper_trade_history.csv"),
+    "PRICE_HISTORY_FILE": os.getenv("PRICE_HISTORY_FILE", "price_history.csv"),
+    "LIVE_MODE": os.getenv("LIVE_MODE", "False").lower() == "true",
+    "PAPER_MODE": os.getenv("PAPER_MODE", "True").lower() == "true"
 }
 
 # Angel One credentials
@@ -83,7 +86,7 @@ def run_live_trading():
                 report_df.to_csv(CONFIG['OUTPUT_FILE'], index=False)
                 
                 price_history_df = pd.DataFrame(price_history)
-                price_history_df.to_csv("price_history.csv", index=False)
+                price_history_df.to_csv(CONFIG['PRICE_HISTORY_FILE'], index=False)
                 
                 # Send email report
                 try:
@@ -196,6 +199,111 @@ def run_live_trading():
             print(f"❌ Live trading error: {e}")
             time.sleep(60)
 
+
+def save_trade_and_price_files(trades, price_history, trade_path, price_path):
+    report_df = pd.DataFrame(trades)
+    report_df.to_csv(trade_path, index=False)
+    price_history_df = pd.DataFrame(price_history)
+    price_history_df.to_csv(price_path, index=False)
+    return report_df, price_history_df
+
+
+def run_paper_trading():
+    """Simulate paper trading with no real-money orders."""
+    print("🧪 Starting PAPER TRADING MODE (no real money)")
+    print(f"📡 Fetching today's {CONFIG['SYMBOL']} 5-minute candles...")
+
+    df = yf.download(CONFIG['SYMBOL'], period="7d", interval="5m")
+    if df.empty:
+        print("❌ Data is empty")
+        return
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df.dropna()
+    df = df[df.index.date == datetime.now().date()]
+    if df.empty:
+        print("❌ No intraday data available for today yet.")
+        return
+
+    df = df.between_time("09:15", "15:15")
+    if df.empty or len(df) < 30:
+        print("❌ Insufficient market-hours candles for paper trading.")
+        return
+
+    data_records = df.reset_index().to_dict('records')
+    trades = []
+    price_history = []
+    in_position = False
+    pos_type, entry_price, entry_time = "", 0.0, None
+    entry_data = {}
+
+    print(f"📊 Simulating {len(data_records)} intraday candles...")
+
+    for i in range(30, len(data_records)):
+        params = risk_management()
+        row = data_records[i]
+        now_time, now_close = row['Datetime'], float(row['Close'])
+
+        price_history.append({
+            "DateTime": now_time,
+            "Price": now_close,
+            "High": float(row['High']),
+            "Low": float(row['Low']),
+            "Volume": float(row['Volume']) if 'Volume' in row else 0
+        })
+
+        price_window = [r['Close'] for r in data_records[i-25:i+1]]
+        signal_data = calculate_signals(
+            price_list=price_window,
+            current_time=now_time,
+            position=(1 if pos_type == "LONG" else -1) if in_position else 0,
+            entry_price=entry_price
+        )
+        action = signal_data.get('action', 'WAIT')
+
+        if not in_position and action in ["BUY_LONG", "SELL_SHORT"]:
+            in_position = True
+            pos_type = "LONG" if "BUY" in action else "SHORT"
+            entry_price = now_close * (1 + (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
+            entry_time = now_time
+            entry_data = signal_data
+            print(f"🟢 Paper order simulated: {pos_type} at {entry_price} @ {entry_time}")
+
+        elif in_position and "EXIT" in action:
+            exit_price = now_close * (1 - (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
+            points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
+            net_pnl = (points * CONFIG['LOT_SIZE']) - params['brokerage_fee']
+
+            trades.append({
+                "Trade_ID": f"PAPER_{len(trades)+1}",
+                "Entry_Time": entry_time,
+                "Exit_Time": now_time,
+                "Type": pos_type,
+                "Entry_Price": round(entry_price, 2),
+                "Exit_Price": round(exit_price, 2),
+                "Points": round(points, 2),
+                "Net_PnL": round(net_pnl, 2),
+                "Exit_Reason": action,
+                "Entry_RSI": entry_data.get('rsi'),
+                "Entry_EMA_F": entry_data.get('ema_f'),
+                "Exit_RSI": signal_data.get('rsi')
+            })
+            print(f"🔴 Paper exit simulated: {pos_type} closed at {exit_price} @ {now_time} | PnL: ₹{net_pnl:.2f}")
+            in_position = False
+
+    if trades:
+        report_df, price_history_df = save_trade_and_price_files(trades, price_history, CONFIG['PAPER_OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'])
+        print(f"\n✅ PAPER TRADING COMPLETE. Trades: {len(report_df)} | Total PnL: ₹{report_df['Net_PnL'].sum():,.2f}")
+        print(f"   Price history written to {CONFIG['PRICE_HISTORY_FILE']}")
+        print(f"   Paper trades written to {CONFIG['PAPER_OUTPUT_FILE']}")
+    else:
+        pd.DataFrame(price_history).to_csv(CONFIG['PRICE_HISTORY_FILE'], index=False)
+        print("\n⚠️ No paper trades were generated today.")
+        print(f"   Price history still saved to {CONFIG['PRICE_HISTORY_FILE']}")
+
+
 def run_angel_backtest():
     # ... existing backtest code ...
     # 1. Fetching valid 60-day window
@@ -301,7 +409,7 @@ def run_angel_backtest():
         
         # Save price history for email reporting
         price_history_df = pd.DataFrame(price_history)
-        price_history_df.to_csv("price_history.csv", index=False)
+        price_history_df.to_csv(CONFIG['PRICE_HISTORY_FILE'], index=False)
         
         print(f"\n✅ DONE. Total PnL: ₹{report_df['Net_PnL'].sum():,.2f} | Trades: {len(report_df)}")
         print(f"   Avg PnL per trade: ₹{report_df['Net_PnL'].mean():,.2f}")
@@ -312,5 +420,7 @@ def run_angel_backtest():
 if __name__ == "__main__":
     if CONFIG['LIVE_MODE']:
         run_live_trading()
+    elif CONFIG['PAPER_MODE']:
+        run_paper_trading()
     else:
         run_angel_backtest()
