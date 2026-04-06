@@ -6,8 +6,6 @@ import time
 from datetime import datetime, timedelta
 from engine import calculate_signals, risk_management
 from dotenv import load_dotenv
-import pyotp
-from SmartApi import SmartConnect
 
 load_dotenv()
 
@@ -53,6 +51,13 @@ def place_order(smart_api, symbol, side, quantity, price):
 def run_live_trading():
     """Run live trading during market hours and exit after market close."""
     print("🚀 Starting LIVE TRADING MODE")
+
+    try:
+        import pyotp
+        from SmartApi import SmartConnect
+    except ImportError as e:
+        print(f"❌ Live trading dependencies not installed: {e}")
+        return
     
     # Initialize API
     smart_api = SmartConnect(api_key=API_KEY)
@@ -121,17 +126,31 @@ def run_live_trading():
             current_price = float(df['Close'].iloc[-1])
             current_time = df.index[-1].to_pydatetime()
             
-            # Track price history
+            # Get price window for signals (last 26 candles = ~2 hours)
+            price_window = df['Close'].tail(26).tolist()
+            signal_data = calculate_signals(
+                price_list=price_window,
+                current_time=current_time,
+                position=(1 if pos_type == "LONG" else -1) if in_position else 0,
+                entry_price=entry_price
+            )
+
+            # Track price history and signal metadata
             price_history.append({
                 "DateTime": current_time,
                 "Price": current_price,
                 "High": float(df['High'].iloc[-1]),
                 "Low": float(df['Low'].iloc[-1]),
-                "Volume": float(df['Volume'].iloc[-1]) if 'Volume' in df.columns else 0
+                "Volume": float(df['Volume'].iloc[-1]) if 'Volume' in df.columns else 0,
+                "Signal": signal_data.get('action', 'WAIT'),
+                "RSI": signal_data.get('rsi'),
+                "RSI_FAST": signal_data.get('rsi_fast'),
+                "EMA_FAST": signal_data.get('ema_f'),
+                "SLOPE": signal_data.get('slope'),
+                "PERCENT_B": signal_data.get('percent_b') if 'percent_b' in signal_data else None,
+                "REGIME": signal_data.get('regime')
             })
             
-            # Get price window for signals (last 26 candles = ~2 hours)
-            price_window = df['Close'].tail(26).tolist()
             if len(price_window) < 20:
                 time.sleep(60)
                 continue
@@ -246,14 +265,6 @@ def run_paper_trading():
         row = data_records[i]
         now_time, now_close = row['Datetime'], float(row['Close'])
 
-        price_history.append({
-            "DateTime": now_time,
-            "Price": now_close,
-            "High": float(row['High']),
-            "Low": float(row['Low']),
-            "Volume": float(row['Volume']) if 'Volume' in row else 0
-        })
-
         price_window = [r['Close'] for r in data_records[i-25:i+1]]
         signal_data = calculate_signals(
             price_list=price_window,
@@ -261,6 +272,22 @@ def run_paper_trading():
             position=(1 if pos_type == "LONG" else -1) if in_position else 0,
             entry_price=entry_price
         )
+
+        price_history.append({
+            "DateTime": now_time,
+            "Price": now_close,
+            "High": float(row['High']),
+            "Low": float(row['Low']),
+            "Volume": float(row['Volume']) if 'Volume' in row else 0,
+            "Signal": signal_data.get('action', 'WAIT'),
+            "RSI": signal_data.get('rsi'),
+            "RSI_FAST": signal_data.get('rsi_fast'),
+            "EMA_FAST": signal_data.get('ema_f'),
+            "SLOPE": signal_data.get('slope'),
+            "PERCENT_B": signal_data.get('percent_b') if 'percent_b' in signal_data else None,
+            "REGIME": signal_data.get('regime')
+        })
+
         action = signal_data.get('action', 'WAIT')
 
         if not in_position and action in ["BUY_LONG", "SELL_SHORT"]:
