@@ -1,0 +1,313 @@
+================================================================================
+                    🚀 DEPLOYMENT FROM SCRATCH - MASTER GUIDE
+================================================================================
+
+📅 Date: April 9, 2026
+✅ Status: ALL COMPONENTS VERIFIED & PRODUCTION READY
+
+================================================================================
+                              QUICK START (10 STEPS)
+================================================================================
+
+STEP 1: Prepare Ubuntu Server
+  □ SSH into your Ubuntu/EC2 server
+  □ Run: sudo apt update && sudo apt upgrade -y
+  □ Install: sudo apt install -y python3 python3-pip python3-venv git nodejs
+  □ Install PM2: sudo npm install -g pm2
+
+STEP 2: Clone Your Project
+  □ cd ~
+  □ git clone https://github.com/YOUR_USERNAME/algo-trade-bot trading_bot
+  □ OR: scp -r ~/Desktop/Work/algo-trade/algo-trade-bot/* user@server:~/trading_bot/
+
+STEP 3: Copy Credentials
+  □ cd ~/trading_bot
+  □ cp .env.example .env
+  □ Edit .env with your credentials:
+    - ANGEL_API_KEY=your_key
+    - ANGEL_CLIENT_ID=your_id
+    - ANGEL_PASSWORD=your_password
+    - ANGEL_TOTP_SECRET=your_secret
+    - EMAIL_SENDER=your_gmail@gmail.com
+    - EMAIL_PASSWORD=your_app_password
+    - RECIPIENT_EMAIL=email1@gmail.com,email2@gmail.com
+
+STEP 4: Deploy with Automation
+  □ bash deploy_and_start.sh
+  □ Wait for completion (2-3 minutes)
+
+STEP 5: Verify Installation
+  □ bash health_check.sh
+  □ Should show all ✅ checks passing
+
+STEP 6: Deploy with PM2
+  □ pm2 start ecosystem.config.js
+  □ pm2 status (should show "stopped" = normal)
+
+STEP 7: Save PM2 Config
+  □ pm2 save
+  □ pm2 startup
+  □ Copy command shown and run with sudo
+
+STEP 8: Test Manually (Optional)
+  □ python3 main.py
+  □ Should show backtest results with all 4 strategies
+
+STEP 9: Send Test Email
+  □ python3 -c "from send_email_report import send_email; send_email()"
+  □ Check inbox for email with strategy comparison
+
+STEP 10: Monitor
+  □ pm2 logs HFT_Bot (show real-time logs)
+  □ bash status_check.sh (quick status)
+  □ bash troubleshoot.sh (full diagnostics)
+
+================================================================================
+                            FILES OVERVIEW
+================================================================================
+
+CORE TRADING FILES:
+  engine.py                    - 4 trading strategies (EMA, RSI, Bollinger, Breakout)
+  main.py                      - Multi-strategy backtesting engine
+  send_email_report.py         - Email reporting with strategy comparison (BCC)
+  requirements.txt             - Python dependencies
+  .env.example                 - Configuration template
+  ecosystem.config.js          - PM2 scheduling config
+
+DEPLOYMENT SCRIPTS:
+  deploy_and_start.sh          - Automated complete setup
+  health_check.sh              - Pre-market health verification
+  status_check.sh              - Quick status overview
+  troubleshoot.sh              - Full diagnostics
+  housekeeping.sh              - Log cleanup
+
+DOCUMENTATION:
+  DEPLOY_FROM_SCRATCH.md       - 10-step deployment guide
+  DEPLOYMENT_QUICK_START.md    - 2-minute quick reference
+  UBUNTU_DEPLOYMENT.md         - Complete operational guide
+  MULTI_STRATEGY_GUIDE.md      - Strategy implementation details
+  SETUP_COMPLETE.md            - Configuration summary
+  PROJECT_SUMMARY.md           - Project overview
+  PIPELINE_VERIFICATION.md     - Complete verification report
+
+================================================================================
+                         WHAT HAPPENS AFTER DEPLOYMENT
+================================================================================
+
+BEFORE 9:15 AM IST:
+  Status: Bot is "stopped" (0 PID, 0% CPU)
+  → This is NORMAL! Bot runs only during market hours
+
+AT 9:15 AM IST:
+  PM2 automatically starts bot via cron_restart
+  Bot fetches market data (2000+ 5-minute candles)
+  4 strategies run in parallel on same price data
+
+DURING 9:15 AM - 3:15 PM IST:
+  All 4 strategies generate trades
+  Results saved: strategy_[1-4]_backtest_results.csv
+  Continuous monitoring and logging
+
+AT 3:15 PM IST:
+  Market closes
+  Bot exits gracefully
+  Results calculated and compared
+
+AT 3:20 PM IST:
+  PM2 cron_stop triggers
+  Bot "stops" (ready for next day)
+  Email report sent with:
+    • Strategy comparison table
+    • Best strategy highlighted (🏆)
+    • Top 5 trades
+    • CSV attachments
+
+NEXT DAY AT 9:15 AM:
+  Process repeats automatically
+
+================================================================================
+                            EXPECTED EMAIL OUTPUT
+================================================================================
+
+Subject: Trading Bot Report - April 9, 2026
+
+📊 Strategy Performance Summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Strategy 1 (EMA Alignment):
+  Total Trades: 45
+  Total PnL: ₹2,450
+  Win Rate: 55.6%
+  Profit Factor: 1.85
+
+Strategy 2 (RSI Mean Reversion):
+  Total Trades: 38
+  Total PnL: ₹1,890
+  Win Rate: 52.6%
+  Profit Factor: 1.62
+
+Strategy 3 (Bollinger Bands) 🏆 BEST:
+  Total Trades: 52
+  Total PnL: ₹3,120
+  Win Rate: 57.7%
+  Profit Factor: 2.15
+
+Strategy 4 (Breakout Momentum):
+  Total Trades: 41
+  Total PnL: ₹2,010
+  Win Rate: 48.8%
+  Profit Factor: 1.48
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏆 TOP PERFORMER: Strategy 3 (Bollinger Bands)
+   Total PnL: ₹3,120 | Win Rate: 57.7%
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📈 Market Summary:
+  Open: ₹23,450.50
+  Close: ₹23,520.30
+  High: ₹23,625.80
+  Low: ₹23,420.10
+  Change: +69.80 (+0.30%)
+
+Top 5 Trades from Strategy 3:
+  1. Entry: 23,450 | Exit: 23,510 | PnL: +₹3,000 | Hold: 45m
+  2. Entry: 23,480 | Exit: 23,540 | PnL: +₹3,000 | Hold: 30m
+  ...
+
+📎 Attachments:
+  • strategy_1_backtest_results.csv
+  • strategy_2_backtest_results.csv
+  • strategy_3_backtest_results.csv
+  • price_history.csv
+
+(Recipients in BCC - hidden from each other)
+
+================================================================================
+                         TROUBLESHOOTING QUICK REFERENCE
+================================================================================
+
+❌ "No intraday data available"
+   ✅ NORMAL - runs only 9:15 AM - 3:15 PM IST
+
+❌ PM2 shows "stopped" status
+   ✅ NORMAL - bot stops after market close, starts at 9:15 AM
+
+❌ Email not received
+   1. Check .env has correct Gmail app password
+   2. Run: bash troubleshoot.sh
+   3. Check spam/promotions folder
+   4. Manual test: python3 -c "from send_email_report import send_email; send_email()"
+
+❌ Module not found error
+   1. source venv/bin/activate
+   2. pip install -r requirements.txt
+   3. bash troubleshoot.sh
+
+❌ Bot doesn't start at 9:15 AM
+   1. timedatectl (verify timezone is Asia/Kolkata for IST)
+   2. grep cron_ ecosystem.config.js (verify cron settings)
+   3. pm2 restart HFT_Bot
+   4. pm2 logs (check logs)
+
+================================================================================
+                           KEY COMMAND REFERENCE
+================================================================================
+
+DEPLOYMENT & SETUP:
+  bash deploy_and_start.sh          # Complete automated setup
+  bash health_check.sh              # Pre-market verification
+  bash troubleshoot.sh              # Full diagnostics
+  bash status_check.sh              # Quick status
+
+PM2 MANAGEMENT:
+  pm2 start ecosystem.config.js     # Deploy bot
+  pm2 status                        # View bot status
+  pm2 logs HFT_Bot                  # Real-time logs
+  pm2 describe HFT_Bot              # Detailed info
+  pm2 restart HFT_Bot               # Force restart
+  pm2 stop HFT_Bot                  # Stop bot
+  pm2 save                          # Save state to disk
+
+MANUAL TESTING:
+  python3 main.py                   # Run backtest
+  python3 -c "from send_email_report import send_email; send_email()"  # Send email
+
+CONFIGURATION:
+  nano .env                         # Edit credentials
+  source venv/bin/activate          # Activate virtual env
+  pip list                          # Show installed packages
+
+================================================================================
+                         DEPLOYMENT CHECKLIST
+================================================================================
+
+PRE-DEPLOYMENT:
+  □ Ubuntu server accessible via SSH
+  □ Python 3.8+ installed
+  □ Node.js installed
+  □ SSH key configured (if using git)
+
+DEPLOYMENT:
+  □ Project cloned/copied to ~/trading_bot
+  □ .env file created with all credentials
+  □ deploy_and_start.sh executed successfully
+  □ health_check.sh shows all ✅
+  □ PM2 deployed with ecosystem.config.js
+  □ PM2 startup enabled (pm2 startup)
+  □ PM2 state saved (pm2 save)
+
+VERIFICATION:
+  □ Syntax check passed (python3 main.py works)
+  □ Email test sent and received
+  □ Test backtest shows all 4 strategies
+  □ PM2 logs show no errors
+  □ Status shows "stopped" before 9:15 AM
+  □ Market hours detection working
+
+POST-DEPLOYMENT:
+  □ Monitor first market day (9:15 AM - 3:15 PM IST)
+  □ Check logs during market: pm2 logs HFT_Bot
+  □ Verify email report received after 3:15 PM
+  □ Review strategy comparison results
+  □ Check trade details in CSV files
+
+================================================================================
+                            SUPPORT & MONITORING
+================================================================================
+
+CONTINUOUS MONITORING:
+  pm2 logs HFT_Bot                  # Real-time monitoring during market hours
+  bash status_check.sh              # Quick status check
+  pm2 monit                         # Process monitoring dashboard
+
+DAILY CHECKS:
+  7:15 AM IST   - Check system status before market
+  9:15 AM IST   - Verify bot started (pm2 logs)
+  9:15-3:15 PM  - Monitor logs if needed
+  3:20 PM IST   - Verify email received with results
+  4:00 PM IST   - Review strategy performance
+
+WEEKLY REVIEWS:
+  Monday        - Review weekend changes/updates
+  Friday EOD    - Review week's performance
+  Any issues    - Run bash troubleshoot.sh
+
+MONTHLY MAINTENANCE:
+  - Review strategy performance trends
+  - Update risk parameters if needed
+  - Backup CSV results
+  - Run system diagnostics
+  - Update market data
+
+================================================================================
+
+✅ READY FOR PRODUCTION DEPLOYMENT
+
+Next Step: SSH to Ubuntu server and follow the "QUICK START (10 STEPS)" above
+
+For more details: Read DEPLOY_FROM_SCRATCH.md
+
+Questions? Run: bash troubleshoot.sh
+
+================================================================================
