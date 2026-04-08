@@ -61,6 +61,23 @@ EMPTY_TRADE_COLUMNS = [
     "Exit_RSI",
     "Strategy",
 ]
+PRICE_HISTORY_COLUMNS = [
+    "DateTime",
+    "Price",
+    "High",
+    "Low",
+    "Volume",
+    "Signal",
+    "RSI",
+    "RSI_FAST",
+    "EMA_FAST",
+    "SLOPE",
+    "PERCENT_B",
+    "REGIME",
+    "Strategy",
+    "Stop_Loss",
+    "Target",
+]
 
 
 def get_forward_strategy_name():
@@ -231,12 +248,11 @@ def finalize_trading_session(trades, price_history, trade_path, price_path, sour
         print(f"   Trades written to {trade_path}")
         return report_df, price_history_df
 
-    pd.DataFrame(columns=EMPTY_TRADE_COLUMNS).to_csv(trade_path, index=False)
-    pd.DataFrame(price_history).to_csv(price_path, index=False)
+    report_df, price_history_df = save_trade_and_price_files([], price_history, trade_path, price_path)
     print(f"\n⚠️ No {source_label.lower()} trades were generated today.")
     print(f"   Empty trade report written to {trade_path}")
     print(f"   Price history still saved to {price_path}")
-    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), pd.DataFrame(price_history)
+    return report_df, price_history_df
 
 
 def place_order(smart_api, symbol, side, quantity, price, exchange="NSE", symbol_token="99926000"):
@@ -504,12 +520,33 @@ def run_live_trading():
         close_angel_session(smart_api)
 
 
+def build_trade_report_frame(trades):
+    if not trades:
+        return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+    return pd.DataFrame(trades)
+
+
+def build_price_history_frame(price_history):
+    if not price_history:
+        return pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
+    return pd.DataFrame(price_history)
+
+
 def save_trade_and_price_files(trades, price_history, trade_path, price_path):
-    report_df = pd.DataFrame(trades)
+    report_df = build_trade_report_frame(trades)
     report_df.to_csv(trade_path, index=False)
-    price_history_df = pd.DataFrame(price_history)
+    price_history_df = build_price_history_frame(price_history)
     price_history_df.to_csv(price_path, index=False)
     return report_df, price_history_df
+
+
+def reset_paper_session_files(session_date):
+    save_trade_and_price_files([], [], CONFIG['PAPER_OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'])
+    print(f"🧹 Reset paper trading files for {session_date.isoformat()}")
+
+
+def persist_paper_session_snapshot(trades, price_history):
+    save_trade_and_price_files(trades, price_history, CONFIG['PAPER_OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'])
 
 
 def run_paper_trading():
@@ -534,10 +571,14 @@ def run_paper_trading():
     stop_loss_price = None
     target_price = None
     last_candle_time = None
+    session_date = None
 
     try:
         while True:
             now = datetime.now()
+            if now.weekday() < 5 and session_date != now.date():
+                reset_paper_session_files(now.date())
+                session_date = now.date()
             market_open, market_close = get_market_window(now)
 
             if now >= market_close:
@@ -648,6 +689,7 @@ def run_paper_trading():
                         "Target": target_price
                     })
                     last_candle_time = current_time
+                    persist_paper_session_snapshot(trades, price_history)
 
                 exit_reason = None
                 if in_position:
@@ -690,6 +732,7 @@ def run_paper_trading():
                         "Strategy": strategy_name
                     })
                     print(f"🔴 Paper exit simulated: {pos_type} closed at {exit_price:.2f} @ {now:%Y-%m-%d %H:%M} | PnL: ₹{net_pnl:.2f} ({exit_reason})")
+                    persist_paper_session_snapshot(trades, price_history)
                     in_position = False
                     pos_type = ""
                     entry_price = 0.0
