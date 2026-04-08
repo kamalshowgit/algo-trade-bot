@@ -255,6 +255,15 @@ def finalize_trading_session(trades, price_history, trade_path, price_path, sour
     return report_df, price_history_df
 
 
+def send_session_email():
+    try:
+        from send_email_report import send_performance_email
+        send_performance_email()
+        print("✅ Email report sent")
+    except Exception as e:
+        print(f"❌ Email failed: {e}")
+
+
 def place_order(smart_api, symbol, side, quantity, price, exchange="NSE", symbol_token="99926000"):
     """Place an order via Angel One API."""
     try:
@@ -341,12 +350,7 @@ def run_live_trading():
                             "Strategy": strategy_name
                         })
                 finalize_trading_session(trades, price_history, CONFIG['OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'], "LIVE TRADING")
-                try:
-                    from send_email_report import send_performance_email
-                    send_performance_email()
-                    print("✅ Email report sent")
-                except Exception as e:
-                    print(f"❌ Email failed: {e}")
+                send_session_email()
                 print("✅ Live trading session complete. Exiting...")
                 return
 
@@ -582,6 +586,7 @@ def run_paper_trading():
             market_open, market_close = get_market_window(now)
 
             if now >= market_close:
+                print("🏁 Market closed. Sending final report...")
                 if in_position:
                     current_price = get_live_price(
                         smart_api,
@@ -611,6 +616,8 @@ def run_paper_trading():
                         })
                         print(f"🔴 Paper exit simulated: {pos_type} closed at {exit_price:.2f} @ {now:%Y-%m-%d %H:%M} | PnL: ₹{net_pnl:.2f} (MARKET_CLOSE)")
                 finalize_trading_session(trades, price_history, CONFIG['PAPER_OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'], "PAPER TRADING")
+                send_session_email()
+                print("✅ Paper trading session complete. Exiting...")
                 return
 
             if now < market_open or now.weekday() >= 5:
