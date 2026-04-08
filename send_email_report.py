@@ -21,6 +21,22 @@ APP_PASSWORD = os.getenv("APP_PASSWORD") or os.getenv("EMAIL_PASSWORD") or os.ge
 TRADE_DATA_PATH = os.getenv("TRADE_DATA_PATH", "./paper_trade_history.csv")
 PRICE_HISTORY_PATH = os.getenv("PRICE_HISTORY_PATH", "./price_history.csv")
 BACKTEST_RESULTS_PATH = os.getenv("BACKTEST_RESULTS_PATH", "./angel_backtest_results.csv")
+PAPER_MODE = os.getenv("PAPER_MODE", "false").strip().lower() == "true"
+EMPTY_TRADE_COLUMNS = [
+    "Trade_ID",
+    "Entry_Time",
+    "Exit_Time",
+    "Type",
+    "Entry_Price",
+    "Exit_Price",
+    "Points",
+    "Net_PnL",
+    "Exit_Reason",
+    "Entry_RSI",
+    "Entry_EMA_F",
+    "Exit_RSI",
+    "Strategy",
+]
 
 
 def format_currency(value):
@@ -173,16 +189,18 @@ def read_backtest_strategy_results():
 
 
 def choose_report_source():
-    if os.path.exists(TRADE_DATA_PATH):
-        trades_df = pd.read_csv(TRADE_DATA_PATH)
-        if not trades_df.empty:
-            return {
-                "source_label": "PAPER TRADE",
-                "trade_path": TRADE_DATA_PATH,
-                "trades_df": validate_trade_frame(trades_df),
-                "strategies_data": {},
-                "best_strategy_name": trades_df["Strategy"].iloc[0] if "Strategy" in trades_df.columns else None,
-            }
+    if PAPER_MODE or os.path.exists(TRADE_DATA_PATH):
+        try:
+            trades_df = pd.read_csv(TRADE_DATA_PATH) if os.path.exists(TRADE_DATA_PATH) else pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+        except pd.errors.EmptyDataError:
+            trades_df = pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+        return {
+            "source_label": "PAPER TRADE",
+            "trade_path": TRADE_DATA_PATH,
+            "trades_df": validate_trade_frame(trades_df) if not trades_df.empty else trades_df,
+            "strategies_data": {},
+            "best_strategy_name": trades_df["Strategy"].iloc[0] if not trades_df.empty and "Strategy" in trades_df.columns else None,
+        }
 
     strategies_data = read_backtest_strategy_results()
     if strategies_data:
@@ -220,7 +238,56 @@ def build_report_summary():
 
     trades_df = source["trades_df"]
     if trades_df.empty:
-        return "No trades executed today.", None, False, None, None, source["trade_path"]
+        price_df, price_summary = read_price_history()
+        today = datetime.now().strftime("%d %b %Y")
+        text_body = [
+            f"TRADING PERFORMANCE REPORT - {today}",
+            "=" * 60,
+            "Status: NO TRADES",
+            f"Source: {source['source_label']}",
+            "",
+            "No trades were executed in this session.",
+        ]
+        if price_summary:
+            text_body += [
+                "",
+                "PRICE ACTION SUMMARY:",
+                f"Opening: {format_currency(price_summary['opening'])}",
+                f"Closing: {format_currency(price_summary['closing'])}",
+                f"Day High: {format_currency(price_summary['high'])}",
+                f"Day Low: {format_currency(price_summary['low'])}",
+                f"Day Change: {format_currency(price_summary['change'])} ({price_summary['change_pct']:+.2f}%)",
+                f"Total Candles: {price_summary['candles']}",
+            ]
+        text_body += [
+            "",
+            f"Report generated at {datetime.now().strftime('%H:%M:%S IST')}",
+        ]
+
+        html_body = [
+            "<html><body style='font-family: Arial, sans-serif; color: #333;'>",
+            f"<h2>Trading Performance Report - {today}</h2>",
+            "<p><strong>Status:</strong> NO TRADES</p>",
+            f"<p><strong>Source:</strong> {source['source_label']}</p>",
+            "<p>No trades were executed in this session.</p>",
+        ]
+        if price_summary:
+            html_body += [
+                "<h3>Price Action Summary</h3>",
+                "<table style='border-collapse: collapse; width: 100%;'>",
+                f"<tr><td style='border:1px solid #ddd; padding:8px;'>Opening</td><td style='border:1px solid #ddd; padding:8px;'>{format_currency(price_summary['opening'])}</td></tr>",
+                f"<tr><td style='border:1px solid #ddd; padding:8px;'>Closing</td><td style='border:1px solid #ddd; padding:8px;'>{format_currency(price_summary['closing'])}</td></tr>",
+                f"<tr><td style='border:1px solid #ddd; padding:8px;'>Day High</td><td style='border:1px solid #ddd; padding:8px;'>{format_currency(price_summary['high'])}</td></tr>",
+                f"<tr><td style='border:1px solid #ddd; padding:8px;'>Day Low</td><td style='border:1px solid #ddd; padding:8px;'>{format_currency(price_summary['low'])}</td></tr>",
+                f"<tr><td style='border:1px solid #ddd; padding:8px;'>Day Change</td><td style='border:1px solid #ddd; padding:8px;'>{format_currency(price_summary['change'])} ({price_summary['change_pct']:+.2f}%)</td></tr>",
+                f"<tr><td style='border:1px solid #ddd; padding:8px;'>Total Candles</td><td style='border:1px solid #ddd; padding:8px;'>{price_summary['candles']}</td></tr>",
+                "</table>",
+            ]
+        html_body += [
+            f"<p style='font-size:12px; color:#666;'>Report generated at {datetime.now().strftime('%H:%M:%S IST')}</p>",
+            "</body></html>",
+        ]
+        return "\n".join(text_body), "\n".join(html_body), True, trades_df, price_df, source["trade_path"]
 
     metrics = compute_trade_metrics(trades_df)
     price_df, price_summary = read_price_history()

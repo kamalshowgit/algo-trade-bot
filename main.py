@@ -46,6 +46,21 @@ API_KEY = os.getenv("ANGEL_API_KEY")
 CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
 PASSWORD = os.getenv("ANGEL_PASSWORD")
 TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
+EMPTY_TRADE_COLUMNS = [
+    "Trade_ID",
+    "Entry_Time",
+    "Exit_Time",
+    "Type",
+    "Entry_Price",
+    "Exit_Price",
+    "Points",
+    "Net_PnL",
+    "Exit_Reason",
+    "Entry_RSI",
+    "Entry_EMA_F",
+    "Exit_RSI",
+    "Strategy",
+]
 
 
 def get_forward_strategy_name():
@@ -216,10 +231,12 @@ def finalize_trading_session(trades, price_history, trade_path, price_path, sour
         print(f"   Trades written to {trade_path}")
         return report_df, price_history_df
 
+    pd.DataFrame(columns=EMPTY_TRADE_COLUMNS).to_csv(trade_path, index=False)
     pd.DataFrame(price_history).to_csv(price_path, index=False)
     print(f"\n⚠️ No {source_label.lower()} trades were generated today.")
+    print(f"   Empty trade report written to {trade_path}")
     print(f"   Price history still saved to {price_path}")
-    return pd.DataFrame(), pd.DataFrame(price_history)
+    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), pd.DataFrame(price_history)
 
 
 def place_order(smart_api, symbol, side, quantity, price, exchange="NSE", symbol_token="99926000"):
