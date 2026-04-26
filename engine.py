@@ -1,309 +1,261 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def get_stats(prices):
-    if len(prices) < 5: return 0.0, 0.0, 0.0
-    y = np.array(prices)
-    x = np.arange(len(y))
-    slope, _ = np.polyfit(x, y, 1)
-    normalized_slope = (slope / y[-1]) * 100
-    
-    mean = np.mean(y)
-    std = np.std(y)
-    z_score = (y[-1] - mean) / (std if std != 0 else 0.001)
-    
-    if len(prices) >= 3:
-        recent_slope = prices[-1] - prices[-2]
-        prior_slope = prices[-2] - prices[-3]
-        velocity = recent_slope - prior_slope
+
+# ==============================
+# SAFE DATA BUILDER (CORE FIX)
+# ==============================
+def _build_market_df(price_list=None, candles_df=None):
+
+    if candles_df is not None:
+        df = candles_df.copy()
     else:
-        velocity = 0
-    
-    return normalized_slope, z_score, velocity
+        df = pd.DataFrame({"Close": price_list})
 
-def get_base_df(price_list):
-    df = pd.DataFrame({'price': price_list})
-    
-    df['ema_fast'] = df['price'].ewm(span=5, adjust=False).mean()
-    df['ema_slow'] = df['price'].ewm(span=12, adjust=False).mean()
-    df['ema_very_fast'] = df['price'].ewm(span=3, adjust=False).mean()
-    
-    df['sma_20'] = df['price'].rolling(window=20).mean()
-    df['std_20'] = df['price'].rolling(window=20).std()
-    df['upper_band'] = df['sma_20'] + (df['std_20'] * 1.5)
-    df['lower_band'] = df['sma_20'] - (df['std_20'] * 1.5)
-    
-    df['percent_b'] = (df['price'] - df['lower_band']) / (df['upper_band'] - df['lower_band'])
-    
-    delta = df['price'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    # Normalize OHLCV column names without mutating other arbitrary columns
+    rename_map = {c: c.capitalize() for c in df.columns if c.lower() in ["open", "high", "low", "close", "volume"]}
+    df = df.rename(columns=rename_map)
+
+    if "Close" not in df.columns:
+        raise ValueError("Close column required")
+
+    # Ensure ALL columns exist (Angel + backtest compatible)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col not in df.columns:
+            if col == "Volume":
+                df[col] = 0.0
+            else:
+                df[col] = df["Close"]
+
+    # Convert safely
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.ffill().bfill()
+
+    df["price"] = df["Close"]
+
+    return df.reset_index(drop=True)
+
+
+# ==============================
+# FEATURE ENGINEERING
+# ==============================
+def get_base_df(price_list=None, candles_df=None):
+
+    df = _build_market_df(price_list, candles_df)
+
+    # EMA TREND
+    df["ema_fast"] = df["price"].ewm(span=9, adjust=False).mean()
+    df["ema_mid"] = df["price"].ewm(span=21, adjust=False).mean()
+    df["ema_slow"] = df["price"].ewm(span=50, adjust=False).mean()
+
+    # VWAP (SAFE for zero volume)
+    vol = df["Volume"].replace(0, np.nan)
+    df["vwap"] = (df["price"] * vol).cumsum() / vol.cumsum()
+    df["vwap"] = df["vwap"].fillna(df["price"])
+
+    # Bollinger Bands
+    df["sma_20"] = df["price"].rolling(20).mean()
+    df["std_20"] = df["price"].rolling(20).std()
+    df["upper_band"] = df["sma_20"] + 2 * df["std_20"]
+    df["lower_band"] = df["sma_20"] - 2 * df["std_20"]
+
+    # RSI
+    delta = df["price"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / (loss + 1e-9)
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    delta_fast = df['price'].diff()
-    gain_fast = (delta_fast.where(delta_fast > 0, 0)).rolling(window=7).mean()
-    loss_fast = (-delta_fast.where(delta_fast < 0, 0)).rolling(window=7).mean()
-    rs_fast = gain_fast / (loss_fast + 1e-9)
-    df['rsi_fast'] = 100 - (100 / (1 + rs_fast))
-    
-    df['roc'] = df['price'].pct_change() * 100
-    
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # ATR
+    prev_close = df["price"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    df["atr"] = tr.rolling(14).mean()
+    df["atr_pct"] = df["atr"] / df["price"]
+
     return df
 
-def risk_management():
-    return {
-        "stop_loss_pct": 0.0010,
-        "breakeven_pct": 0.0002,
-        "target_pct_1": 0.0004,
-        "target_pct_2": 0.0006,
-        "target_pct_3": 0.0008,
-        "brokerage_fee": 60,
-        "min_pnl_to_trail": 0.0002,
-        "trail_distance": 0.0003,
-        "suggested_qty": 100,
-    }
 
+# ==============================
+# REGIME DETECTION (IMPROVED)
+# ==============================
 def get_market_regime(df):
-    """Get market trend: 1=Uptrend, -1=Downtrend, 0=Choppy"""
-    if len(df) < 30: return 0
-    
-    price_now = df['price'].iloc[-1]
-    price_30_ago = df['price'].iloc[-30]
-    price_change_30 = (price_now - price_30_ago) / price_30_ago
-    
-    ema_fast = df['ema_fast'].iloc[-1]
-    ema_slow = df['ema_slow'].iloc[-1]
-    ema_very_fast = df['ema_very_fast'].iloc[-1]
-    
-    if ema_very_fast > ema_fast > ema_slow and price_change_30 > -0.001:
-        return 1
-    elif ema_very_fast < ema_fast < ema_slow and price_change_30 < 0.001:
-        return -1
-    else:
+
+    if len(df) < 30:
         return 0
 
-# ============================================
-# STRATEGY 1: EMA ALIGNMENT
-# ============================================
-def strategy_1_ema_alignment(current, current_time, entry_price, position, slope, z_score, velocity=0, df=None):
-    now_m = current_time.hour * 60 + current_time.minute
-    risk = risk_management()
-    is_trading_hours = 555 <= now_m <= 915 
-    regime = get_market_regime(df) if df is not None else 0
+    c = df.iloc[-1]
 
-    if position != 0:
-        pnl = (current['price'] - entry_price) / entry_price if position > 0 else (entry_price - current['price']) / entry_price
-        
-        if pnl >= risk['target_pct_3']:
-            return "EXIT_SCALE_3"
-        if pnl >= risk['target_pct_2']:
-            return "EXIT_SCALE_2"
-        if pnl >= risk['target_pct_1']:
-            return "EXIT_SCALE_1"
-        
-        if pnl >= risk['min_pnl_to_trail']:
-            if position > 0 and velocity < -0.0005:
-                return "EXIT_REVERSAL"
-            if position < 0 and velocity > 0.0005:
-                return "EXIT_REVERSAL"
-        
-        if pnl <= -risk['stop_loss_pct']:
-            return "EXIT_SL"
+    ema_diff = abs(c["ema_fast"] - c["ema_mid"]) / c["price"]
 
-    if position == 0 and is_trading_hours:
-        ema_aligned_long = current['ema_very_fast'] > current['ema_fast'] > current['ema_slow']
-        ema_cross_long = (slope > 0.0008 and current['ema_fast'] > current['ema_slow'])
-        
-        if (ema_aligned_long or ema_cross_long):
-            if current['rsi_fast'] > 42 and current['percent_b'] < 0.65 and regime >= 0:
-                return "BUY_LONG"
-        
-        if current['percent_b'] < 0.30 and slope > 0.0010:
-            if current['rsi_fast'] > 35 and current['ema_fast'] > current['ema_slow'] and regime >= 0:
-                return "BUY_LONG"
-        
-        ema_aligned_short = current['ema_very_fast'] < current['ema_fast'] < current['ema_slow']
-        ema_cross_short = (slope < -0.0008 and current['ema_fast'] < current['ema_slow'])
-        
-        if (ema_aligned_short or ema_cross_short):
-            if current['rsi_fast'] < 58 and current['percent_b'] > 0.35 and regime <= 0:
-                return "SELL_SHORT"
-        
-        if current['percent_b'] > 0.70 and slope < -0.0010:
-            if current['rsi_fast'] < 65 and current['ema_fast'] < current['ema_slow'] and regime <= 0:
-                return "SELL_SHORT"
+    trend_up = c["ema_fast"] > c["ema_mid"] and c["price"] >= c["vwap"]
+    trend_down = c["ema_fast"] < c["ema_mid"] and c["price"] <= c["vwap"]
 
-    return "WAIT"
+    # Require an even stronger trend spread to avoid sideways chop whipsaws
+    if ema_diff > 0.0015:
+        if trend_up:
+            return 1
+        if trend_down:
+            return -1
 
-# ============================================
-# STRATEGY 2: RSI-BASED MEAN REVERSION
-# ============================================
-def strategy_2_rsi_based(current, current_time, entry_price, position, slope, z_score, velocity=0, df=None):
-    now_m = current_time.hour * 60 + current_time.minute
-    risk = risk_management()
-    is_trading_hours = 555 <= now_m <= 915
+    return 0
 
-    if position != 0:
-        pnl = (current['price'] - entry_price) / entry_price if position > 0 else (entry_price - current['price']) / entry_price
-        
-        if pnl >= risk['target_pct_3']:
-            return "EXIT_SCALE_3"
-        if pnl >= risk['target_pct_2']:
-            return "EXIT_SCALE_2"
-        if pnl >= risk['target_pct_1']:
-            return "EXIT_SCALE_1"
-        
-        if position > 0 and current['rsi'] > 70:
-            return "EXIT_RSI_OVERBOUGHT"
-        if position < 0 and current['rsi'] < 30:
-            return "EXIT_RSI_OVERSOLD"
-        
-        if pnl <= -risk['stop_loss_pct']:
-            return "EXIT_SL"
 
-    if position == 0 and is_trading_hours:
-        if current['rsi'] < 35 and current['rsi_fast'] > current['rsi']:
-            if slope > 0 and current['price'] > current['ema_slow']:
-                return "BUY_LONG"
-        
-        if current['rsi'] < 40 and current['percent_b'] < 0.25 and current['roc'] > 0:
+# ==============================
+# RISK MANAGEMENT
+# ==============================
+def risk_management(current=None, capital=100000, lot_size=50):
+
+    atr_pct = 0.002
+
+    if current is not None:
+        try:
+            val = float(current.get("atr_pct", atr_pct))
+            if np.isfinite(val) and val > 0:
+                atr_pct = val
+        except:
+            pass
+
+    stop_loss_pct = float(np.clip(max(atr_pct * 1.5, 0.0025), 0.0025, 0.006)) # Tighten SL slightly
+    # 1:2.5 R/R with dynamic trailing
+    target_pct = float(max(stop_loss_pct * 2.5, 0.0065))
+    breakeven_pct = float(stop_loss_pct * 0.5) # Move to breakeven MUCH faster
+    trail_distance = float(stop_loss_pct * 0.4) # Tighten trail once in profit
+
+    return {
+        "stop_loss_pct": stop_loss_pct,
+        "target_pct": target_pct,
+        "breakeven_pct": breakeven_pct,
+        "trail_distance": trail_distance,
+        "brokerage_fee": 60,
+        "risk_per_trade_pct": 0.01,
+        "daily_loss_limit_pct": 0.02,
+        "lot_size": lot_size,
+        "capital": capital,
+    }
+
+
+# ==============================
+# POSITION SIZING
+# ==============================
+def calculate_position_size(price, stop_loss_pct, capital=100000, lot_size=50, risk_per_trade_pct=0.01):
+
+    if price <= 0 or stop_loss_pct <= 0:
+        return lot_size
+
+    risk_amount = capital * risk_per_trade_pct
+    risk_per_lot = price * stop_loss_pct * lot_size
+
+    if risk_per_lot <= 0:
+        return lot_size
+
+    risk_lots = max(1, int(np.floor(risk_amount / risk_per_lot)))
+    
+    # Smart Capital Rule: Never deploy > 25% of total capital on a single trade
+    max_capital_for_trade = capital * 0.25
+    cost_per_lot = price * lot_size
+    capital_lots = max(1, int(np.floor(max_capital_for_trade / cost_per_lot)))
+
+    lots = min(risk_lots, capital_lots)
+    return lots * lot_size
+
+
+# ==============================
+# SIGNAL LOGIC
+# ==============================
+def trend_signal(c, regime):
+
+    if regime == 1:
+        if c["price"] > c["ema_fast"] > c["ema_mid"] and c["price"] >= c["vwap"] and c["rsi"] > 60:
             return "BUY_LONG"
-        
-        if current['rsi'] > 65 and current['rsi_fast'] < current['rsi']:
-            if slope < 0 and current['price'] < current['ema_slow']:
-                return "SELL_SHORT"
-        
-        if current['rsi'] > 60 and current['percent_b'] > 0.75 and current['roc'] < 0:
+
+    if regime == -1:
+        if c["price"] < c["ema_fast"] < c["ema_mid"] and c["price"] <= c["vwap"] and c["rsi"] < 40:
             return "SELL_SHORT"
 
     return "WAIT"
 
-# ============================================
-# STRATEGY 3: BOLLINGER BANDS
-# ============================================
-def strategy_3_bollinger_mean_reversion(current, current_time, entry_price, position, slope, z_score, velocity=0, df=None):
-    now_m = current_time.hour * 60 + current_time.minute
-    risk = risk_management()
-    is_trading_hours = 555 <= now_m <= 915
 
-    if position != 0:
-        pnl = (current['price'] - entry_price) / entry_price if position > 0 else (entry_price - current['price']) / entry_price
-        
-        if pnl >= risk['target_pct_3']:
-            return "EXIT_SCALE_3"
-        if pnl >= risk['target_pct_2']:
-            return "EXIT_SCALE_2"
-        if pnl >= risk['target_pct_1']:
-            return "EXIT_SCALE_1"
-        
-        if position > 0 and current['price'] >= current['upper_band'] * 0.98:
-            return "EXIT_PRICE_TARGET"
-        if position < 0 and current['price'] <= current['lower_band'] * 1.02:
-            return "EXIT_PRICE_TARGET"
-        
-        if pnl <= -risk['stop_loss_pct']:
-            return "EXIT_SL"
+def mean_reversion_signal(c, regime):
 
-    if position == 0 and is_trading_hours:
-        if current['price'] < current['lower_band'] * 1.01 and slope > 0:
-            if current['rsi_fast'] > 30:
-                return "BUY_LONG"
-        
-        if current['percent_b'] < 0.15 and current['price'] < current['sma_20'] * 0.99:
-            if current['roc'] > -0.05:
-                return "BUY_LONG"
-        
-        if current['price'] > current['upper_band'] * 0.99 and slope < 0:
-            if current['rsi_fast'] < 70:
-                return "SELL_SHORT"
-        
-        if current['percent_b'] > 0.85 and current['price'] > current['sma_20'] * 1.01:
-            if current['roc'] < 0.05:
-                return "SELL_SHORT"
+    if regime != 0:
+        return "WAIT"
+
+    if c["rsi"] < 30 and c["price"] <= c["lower_band"]:
+        return "BUY_LONG"
+
+    if c["rsi"] > 70 and c["price"] >= c["upper_band"]:
+        return "SELL_SHORT"
 
     return "WAIT"
 
-# ============================================
-# STRATEGY 4: BREAKOUT & MOMENTUM
-# ============================================
-def strategy_4_breakout_momentum(current, current_time, entry_price, position, slope, z_score, velocity=0, df=None):
-    now_m = current_time.hour * 60 + current_time.minute
-    risk = risk_management()
-    is_trading_hours = 555 <= now_m <= 915
-    regime = get_market_regime(df) if df is not None else 0
 
-    if position != 0:
-        pnl = (current['price'] - entry_price) / entry_price if position > 0 else (entry_price - current['price']) / entry_price
-        
-        if pnl >= risk['target_pct_3']:
-            return "EXIT_SCALE_3"
-        if pnl >= risk['target_pct_2']:
-            return "EXIT_SCALE_2"
-        if pnl >= risk['target_pct_1']:
-            return "EXIT_SCALE_1"
-        
-        if velocity < -0.001 and position > 0:
-            return "EXIT_MOMENTUM_REVERSAL"
-        if velocity > 0.001 and position < 0:
-            return "EXIT_MOMENTUM_REVERSAL"
-        
-        if pnl <= -risk['stop_loss_pct']:
-            return "EXIT_SL"
+# ==============================
+# MAIN SIGNAL ENGINE
+# ==============================
+def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwargs):
 
-    if position == 0 and is_trading_hours:
-        if slope > 0.0015 and velocity > 0.0005:
-            if current['rsi_fast'] > 50 and current['roc'] > 0.08 and (regime >= 0 or regime == 0):
-                return "BUY_LONG"
-        
-        if current['price'] > current['ema_fast'] and current['ema_fast'] > current['ema_slow']:
-            if slope > 0.001 and current['rsi'] > 55:
-                return "BUY_LONG"
-        
-        if slope < -0.0015 and velocity < -0.0005:
-            if current['rsi_fast'] < 50 and current['roc'] < -0.08 and (regime <= 0 or regime == 0):
-                return "SELL_SHORT"
-        
-        if current['price'] < current['ema_fast'] and current['ema_fast'] < current['ema_slow']:
-            if slope < -0.001 and current['rsi'] < 45:
-                return "SELL_SHORT"
+    candles_df = kwargs.get("candles_df")
+    capital = kwargs.get("capital", 100000)
+    lot_size = kwargs.get("lot_size", 50)
 
-    return "WAIT"
-
-# ============================================
-# STRATEGY SELECTOR
-# ============================================
-STRATEGIES = {
-    "strategy_1": strategy_1_ema_alignment,
-    "strategy_2": strategy_2_rsi_based,
-    "strategy_3": strategy_3_bollinger_mean_reversion,
-    "strategy_4": strategy_4_breakout_momentum
-}
-
-def calculate_signals(price_list, current_time, position=0, entry_price=0, strategy_name="strategy_1", **kwargs):
-    if len(price_list) < 20: 
+    if candles_df is None and (price_list is None or len(price_list) < 30):
         return {"action": "WAIT"}
-    
-    slope, z_score, velocity = get_stats(price_list[-10:])
-    df = get_base_df(price_list)
+
+    df = get_base_df(price_list=price_list, candles_df=candles_df)
+
+    if len(df) < 30:
+        return {"action": "WAIT"}
+
     current = df.iloc[-1]
-    risk = risk_management()
+
     regime = get_market_regime(df)
-    
-    strategy_func = STRATEGIES.get(strategy_name, strategy_1_ema_alignment)
-    action = strategy_func(current, current_time, entry_price, position, slope, z_score, velocity, df)
-    
+    risk = risk_management(current=current, capital=capital, lot_size=lot_size)
+
+    qty = calculate_position_size(
+        price=float(current["price"]),
+        stop_loss_pct=risk["stop_loss_pct"],
+        capital=capital,
+        lot_size=lot_size,
+        risk_per_trade_pct=risk["risk_per_trade_pct"],
+    )
+
+    # ================= ENTRY =================
+    action = "WAIT"
+
+    if position == 0:
+        action = trend_signal(current, regime)
+
+        if action == "WAIT":
+            action = mean_reversion_signal(current, regime)
+
+    # ================= EXIT =================
+    elif position > 0:
+        if regime == -1 or current["price"] < current["ema_mid"]:
+            action = "EXIT_LONG"
+
+    elif position < 0:
+        if regime == 1 or current["price"] > current["ema_mid"]:
+            action = "EXIT_SHORT"
+
     return {
-        "action": action, 
-        "price": round(float(current['price']), 2),
-        "rsi": round(float(df['rsi'].iloc[-1]), 2),
-        "rsi_fast": round(float(df['rsi_fast'].iloc[-1]), 2),
-        "ema_f": round(float(current['ema_fast']), 2),
-        "slope": round(slope, 4),
-        "z_score": round(z_score, 2),
+        "action": action,
+        "price": round(float(current["price"]), 2),
+        "ema_fast": round(float(current["ema_fast"]), 2),
+        "ema_mid": round(float(current["ema_mid"]), 2),
+        "vwap": round(float(current["vwap"]), 2),
+        "rsi": round(float(current["rsi"]), 2),
+        "atr_pct": round(float(current["atr_pct"]), 5) if pd.notna(current["atr_pct"]) else None,
         "regime": regime,
-        "stop_loss_pct": risk['stop_loss_pct'],
-        "target_pct": risk['target_pct_1'],
-        "brokerage_fee": risk['brokerage_fee'],
-        "strategy": strategy_name
+        "stop_loss_pct": risk["stop_loss_pct"],
+        "target_pct": risk["target_pct"],
+        "breakeven_pct": risk["breakeven_pct"],
+        "trail_distance": risk["trail_distance"],
+        "suggested_qty": qty,
     }

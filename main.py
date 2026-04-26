@@ -3,6 +3,8 @@ import numpy as np
 import yfinance as yf
 import os
 import time
+import glob
+from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dt_time
 from engine import STRATEGIES, calculate_signals, risk_management
 from dotenv import load_dotenv
@@ -19,16 +21,20 @@ def get_int_env(name, default, minimum=None):
     return value
 
 
+def get_bool_env(name, default):
+    return os.getenv(name, str(default)).strip().lower() == "true"
+
+
 CONFIG = {
     "SYMBOL": "^NSEI",
     "LOT_SIZE": 50,
     "CAPITAL": 100000,
-    "SLIPPAGE_BPS": 0.0004,
+    "SLIPPAGE_BPS": 0.0003,
     "OUTPUT_FILE": "angel_backtest_results.csv",
     "PAPER_OUTPUT_FILE": os.getenv("PAPER_OUTPUT_FILE", "paper_trade_history.csv"),
     "PRICE_HISTORY_FILE": os.getenv("PRICE_HISTORY_FILE", "price_history.csv"),
-    "LIVE_MODE": os.getenv("LIVE_MODE", "False").lower() == "true",
-    "PAPER_MODE": os.getenv("PAPER_MODE", "True").lower() == "true",
+    "LIVE_MODE": get_bool_env("LIVE_MODE", False),
+    "PAPER_MODE": get_bool_env("PAPER_MODE", True),
     "MARKET_DATA_EXCHANGE": os.getenv("MARKET_DATA_EXCHANGE", "NSE"),
     "MARKET_DATA_SYMBOL": os.getenv("MARKET_DATA_SYMBOL", "NIFTY"),
     "MARKET_DATA_SYMBOL_TOKEN": os.getenv("MARKET_DATA_SYMBOL_TOKEN", "99926000"),
@@ -38,7 +44,11 @@ CONFIG = {
     "TRADE_EXCHANGE": os.getenv("TRADE_EXCHANGE", "NSE"),
     "TRADE_SYMBOL": os.getenv("TRADE_SYMBOL", "NIFTY30APR26FUT"),
     "TRADE_SYMBOL_TOKEN": os.getenv("TRADE_SYMBOL_TOKEN", "99926000"),
-    "FORWARD_STRATEGY": os.getenv("FORWARD_STRATEGY", "strategy_1").strip().lower()
+    "FORWARD_STRATEGY": os.getenv("FORWARD_STRATEGY", "strategy_4").strip().lower(),
+    "AUTO_TUNE_FROM_LOCAL_DATA": get_bool_env("AUTO_TUNE_FROM_LOCAL_DATA", True),
+    "MIN_LOCAL_TRAINING_FILES": get_int_env("MIN_LOCAL_TRAINING_FILES", 3, minimum=1),
+    "LOCAL_PRICE_HISTORY_PATTERNS": os.getenv("LOCAL_PRICE_HISTORY_PATTERNS", "../price_history*.csv,price_history*.csv"),
+    "MAX_LATENCY_SECONDS": get_int_env("MAX_LATENCY_SECONDS", 2),
 }
 
 # Angel One credentials
@@ -51,6 +61,7 @@ EMPTY_TRADE_COLUMNS = [
     "Entry_Time",
     "Exit_Time",
     "Type",
+    "Qty",
     "Entry_Price",
     "Exit_Price",
     "Points",
@@ -59,6 +70,7 @@ EMPTY_TRADE_COLUMNS = [
     "Entry_RSI",
     "Entry_EMA_F",
     "Exit_RSI",
+    "Entry_Score",
     "Strategy",
 ]
 PRICE_HISTORY_COLUMNS = [
@@ -73,6 +85,9 @@ PRICE_HISTORY_COLUMNS = [
     "EMA_FAST",
     "SLOPE",
     "PERCENT_B",
+    "ATR",
+    "Volume_Ratio",
+    "Entry_Score",
     "REGIME",
     "Strategy",
     "Stop_Loss",
@@ -86,6 +101,592 @@ def get_forward_strategy_name():
         print(f"⚠️  Unknown FORWARD_STRATEGY '{strategy_name}'. Falling back to strategy_1.")
         return "strategy_1"
     return strategy_name
+
+
+def minute_to_label(total_minutes):
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+@dataclass(frozen=True)
+class TradingProfile:
+    strategy_name: str
+    entry_start_minute: int = 555
+    entry_end_minute: int = 915
+    skip_midday: bool = False
+    allow_long: bool = True
+    allow_short: bool = True
+    source: str = "config"
+
+    def permits_entry(self, action, current_time):
+        minute = current_time.hour * 60 + current_time.minute
+        if minute < self.entry_start_minute or minute > self.entry_end_minute:
+            return False
+        if self.skip_midday and 735 <= minute <= 795:
+            return False
+        if action == "BUY_LONG":
+            return self.allow_long
+        if action == "SELL_SHORT":
+            return self.allow_short
+        return True
+
+    def describe(self):
+        direction = "both sides"
+        if self.allow_long and not self.allow_short:
+            direction = "long only"
+        elif self.allow_short and not self.allow_long:
+            direction = "short only"
+        midday = "skip 12:15-13:15" if self.skip_midday else "trade through lunch"
+        return (
+            f"{self.strategy_name} | {minute_to_label(self.entry_start_minute)}-"
+            f"{minute_to_label(self.entry_end_minute)} | {direction} | {midday}"
+        )
+
+
+def build_default_trading_profile():
+    return TradingProfile(strategy_name=get_forward_strategy_name(), source="config")
+
+
+def find_local_price_history_files():
+    matched_paths = []
+    for raw_pattern in CONFIG["LOCAL_PRICE_HISTORY_PATTERNS"].split(","):
+        pattern = raw_pattern.strip()
+        if not pattern:
+            continue
+        matched_paths.extend(glob.glob(pattern))
+    unique_paths = []
+    seen = set()
+    for path in sorted(matched_paths):
+        normalized = os.path.abspath(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_paths.append(path)
+    return unique_paths
+
+
+def load_local_price_history_records():
+    records_by_day = []
+    used_files = []
+
+    for path in find_local_price_history_files():
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+
+        if df.empty or "DateTime" not in df.columns or "Price" not in df.columns:
+            continue
+
+        day_records = []
+        for _, row in df.iterrows():
+            price = row.get("Price")
+            timestamp = row.get("DateTime")
+            if pd.isna(price) or pd.isna(timestamp):
+                continue
+            try:
+                close_price = float(price)
+                day_records.append({
+                    "DateTime": normalize_market_timestamp(timestamp).to_pydatetime(),
+                    "Open": close_price,
+                    "High": float(row.get("High", close_price) or close_price),
+                    "Low": float(row.get("Low", close_price) or close_price),
+                    "Close": close_price,
+                    "Volume": float(row.get("Volume", 0.0) or 0.0),
+                })
+            except Exception:
+                continue
+
+        if len(day_records) < 26:
+            continue
+
+        records_by_day.append(day_records)
+        used_files.append(path)
+
+    return records_by_day, used_files
+
+
+def precompute_strategy_signals(records_by_day, strategy_names):
+    signal_cache = {}
+
+    for strategy_name in strategy_names:
+        day_cache = []
+        for day_records in records_by_day:
+            candle_cache = []
+            for index in range(29, len(day_records)):
+                record = day_records[index]
+                recent_candles = build_candles_frame_from_records(day_records[max(0, index - 59):index + 1])
+                price_window = recent_candles["Close"].tolist()
+                signal_data = calculate_signals(
+                    price_list=price_window,
+                    current_time=record["DateTime"],
+                    position=0,
+                    entry_price=0.0,
+                    strategy_name=strategy_name,
+                    candles_df=recent_candles,
+                    capital=CONFIG["CAPITAL"],
+                    lot_size=CONFIG["LOT_SIZE"],
+                )
+                candle_cache.append({
+                    "DateTime": record["DateTime"],
+                    "Close": float(record["Close"]),
+                    "SignalData": signal_data,
+                })
+            day_cache.append(candle_cache)
+        signal_cache[strategy_name] = day_cache
+
+    return signal_cache
+
+
+def simulate_profile_from_cache(profile, signal_cache):
+    pnls = []
+
+    for candles in signal_cache.get(profile.strategy_name, []):
+        in_position = False
+        pos_type = ""
+        entry_price = 0.0
+        quantity = 0
+        stop_loss_price = None
+        target_price = None
+        entry_data = {}
+        daily_pnl = 0.0
+        daily_trading_paused = False
+
+        for candle in candles:
+            current_time = candle["DateTime"]
+            current_price = candle["Close"]
+            signal_data = candle["SignalData"]
+            action = signal_data.get("action", "WAIT")
+            params = risk_management()
+
+            if daily_pnl <= -get_daily_loss_limit_amount():
+                daily_trading_paused = True
+
+            if not in_position and action in ["BUY_LONG", "SELL_SHORT"] and (
+                daily_trading_paused or not profile.permits_entry(action, current_time)
+            ):
+                action = "WAIT"
+
+            if not in_position and action in ["BUY_LONG", "SELL_SHORT"]:
+                pos_type = "LONG" if action == "BUY_LONG" else "SHORT"
+                quantity = int(signal_data.get("suggested_qty", CONFIG["LOT_SIZE"]))
+                entry_price = current_price * (1 + (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
+                stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
+                entry_data = signal_data
+                in_position = True
+                continue
+
+            if not in_position:
+                continue
+
+            stop_loss_price = update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data)
+
+            exit_reason = None
+            if stop_loss_price is not None and ((pos_type == "LONG" and current_price <= stop_loss_price) or (pos_type == "SHORT" and current_price >= stop_loss_price)):
+                exit_reason = "EXIT_SL"
+            elif target_price is not None and ((pos_type == "LONG" and current_price >= target_price) or (pos_type == "SHORT" and current_price <= target_price)):
+                exit_reason = "EXIT_TARGET"
+            elif action.startswith("EXIT"):
+                exit_reason = action
+
+            if exit_reason is None:
+                continue
+
+            exit_price = current_price * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
+            _, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", params["brokerage_fee"]))
+            pnls.append(net_pnl)
+            daily_pnl += net_pnl
+            in_position = False
+            pos_type = ""
+            entry_price = 0.0
+            quantity = 0
+            stop_loss_price = None
+            target_price = None
+            entry_data = {}
+
+    trades = len(pnls)
+    total_pnl = round(sum(pnls), 2)
+    win_rate = round(((sum(1 for value in pnls if value > 0) / trades) * 100), 2) if trades else 0.0
+    avg_pnl = round((total_pnl / trades), 2) if trades else 0.0
+    return {
+        "trades": trades,
+        "total_pnl": total_pnl,
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+    }
+
+
+def build_candidate_trading_profiles():
+    candidates = []
+    seen = set()
+
+    for strategy_name in ("strategy_1", "strategy_2", "strategy_3", "strategy_4"):
+        for entry_start, entry_end in ((555, 915), (585, 870), (600, 840), (600, 825)):
+            for skip_midday in (False, True):
+                for allow_long, allow_short in ((True, True), (True, False), (False, True)):
+                    key = (strategy_name, entry_start, entry_end, skip_midday, allow_long, allow_short)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(
+                        TradingProfile(
+                            strategy_name=strategy_name,
+                            entry_start_minute=entry_start,
+                            entry_end_minute=entry_end,
+                            skip_midday=skip_midday,
+                            allow_long=allow_long,
+                            allow_short=allow_short,
+                            source="adaptive",
+                        )
+                    )
+
+    return candidates
+
+
+def resolve_trading_profile():
+    fallback_profile = build_default_trading_profile()
+
+    if not CONFIG["AUTO_TUNE_FROM_LOCAL_DATA"]:
+        print(f"🧭 Adaptive tuning disabled. Using configured profile: {fallback_profile.describe()}")
+        return fallback_profile
+
+    records_by_day, used_files = load_local_price_history_records()
+    if len(records_by_day) < CONFIG["MIN_LOCAL_TRAINING_FILES"]:
+        print(
+            f"🧭 Adaptive tuning skipped. Found {len(records_by_day)} local price-history files, "
+            f"need at least {CONFIG['MIN_LOCAL_TRAINING_FILES']}."
+        )
+        print(f"   Using configured profile: {fallback_profile.describe()}")
+        return fallback_profile
+
+    candidate_profiles = build_candidate_trading_profiles()
+    signal_cache = precompute_strategy_signals(
+        records_by_day,
+        sorted({profile.strategy_name for profile in candidate_profiles}),
+    )
+
+    minimum_trades = max(4, len(records_by_day) - 1)
+    scored_profiles = []
+    for profile in candidate_profiles:
+        stats = simulate_profile_from_cache(profile, signal_cache)
+        if stats["trades"] < minimum_trades:
+            continue
+        scored_profiles.append((stats, profile))
+
+    baseline_stats = simulate_profile_from_cache(fallback_profile, signal_cache)
+    if not scored_profiles:
+        print("🧭 Adaptive tuning could not find a profile with enough sample trades.")
+        print(
+            f"   Baseline profile: {fallback_profile.describe()} | "
+            f"{baseline_stats['trades']} trades | PnL ₹{baseline_stats['total_pnl']:,.2f}"
+        )
+        return fallback_profile
+
+    best_stats, best_profile = max(
+        scored_profiles,
+        key=lambda item: (item[0]["total_pnl"], item[0]["win_rate"], item[0]["avg_pnl"]),
+    )
+
+    selected_profile = TradingProfile(
+        strategy_name=best_profile.strategy_name,
+        entry_start_minute=best_profile.entry_start_minute,
+        entry_end_minute=best_profile.entry_end_minute,
+        skip_midday=best_profile.skip_midday,
+        allow_long=best_profile.allow_long,
+        allow_short=best_profile.allow_short,
+        source=f"adaptive ({len(used_files)} sessions)",
+    )
+
+    print(f"🧪 Adaptive tuning used {len(used_files)} local sessions")
+    print(
+        f"   Baseline: {fallback_profile.describe()} | "
+        f"{baseline_stats['trades']} trades | PnL ₹{baseline_stats['total_pnl']:,.2f}"
+    )
+    print(
+        f"   Selected: {selected_profile.describe()} | "
+        f"{best_stats['trades']} trades | PnL ₹{best_stats['total_pnl']:,.2f} | "
+        f"Win rate {best_stats['win_rate']:.1f}%"
+    )
+    return selected_profile
+
+
+def build_candles_frame_from_records(records):
+    candles = pd.DataFrame(records).copy()
+    if "Close" not in candles.columns and "Price" in candles.columns:
+        candles["Close"] = candles["Price"]
+    candles["Open"] = pd.to_numeric(candles.get("Open", candles["Close"]), errors="coerce").fillna(candles["Close"])
+    candles["High"] = pd.to_numeric(candles.get("High", candles["Close"]), errors="coerce").fillna(candles["Close"])
+    candles["Low"] = pd.to_numeric(candles.get("Low", candles["Close"]), errors="coerce").fillna(candles["Close"])
+    candles["Close"] = pd.to_numeric(candles["Close"], errors="coerce")
+    candles["Volume"] = pd.to_numeric(candles.get("Volume", 0.0), errors="coerce").fillna(0.0)
+    return candles[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def get_recent_candles_from_records(data_records, index, lookback=60):
+    start_index = max(0, index - lookback + 1)
+    return build_candles_frame_from_records(data_records[start_index:index + 1])
+
+
+def get_recent_candles_from_market_df(df, lookback=60):
+    window = df.tail(lookback).reset_index(drop=True)
+    return build_candles_frame_from_records(window.to_dict("records"))
+
+
+def calculate_entry_levels(entry_price, pos_type, signal_data):
+    stop_loss_pct = float(signal_data.get("stop_loss_pct", risk_management()["stop_loss_pct"]))
+    target_pct = float(signal_data.get("target_pct", risk_management()["target_pct"]))
+    if pos_type == "LONG":
+        stop_loss_price = entry_price * (1 - stop_loss_pct)
+        target_price = entry_price * (1 + target_pct)
+    else:
+        stop_loss_price = entry_price * (1 + stop_loss_pct)
+        target_price = entry_price * (1 - target_pct)
+    return stop_loss_price, target_price
+
+
+def update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data):
+    breakeven_pct = float(entry_data.get("breakeven_pct", risk_management()["breakeven_pct"]))
+    trail_distance = float(entry_data.get("trail_distance", risk_management()["trail_distance"]))
+    pnl_pct = ((current_price - entry_price) / entry_price) if pos_type == "LONG" else ((entry_price - current_price) / entry_price)
+    if pnl_pct < breakeven_pct:
+        return stop_loss_price
+
+    if pos_type == "LONG":
+        trailing_candidate = max(entry_price, current_price * (1 - trail_distance))
+        return max(stop_loss_price or entry_price, trailing_candidate)
+
+    trailing_candidate = min(entry_price, current_price * (1 + trail_distance))
+    return min(stop_loss_price or entry_price, trailing_candidate)
+
+
+def calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, brokerage_fee):
+    points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
+    net_pnl = (points * quantity) - brokerage_fee
+    return points, net_pnl
+
+
+def get_daily_loss_limit_amount():
+    return CONFIG["CAPITAL"] * risk_management()["daily_loss_limit_pct"]
+
+
+def calculate_performance_stats(report_df):
+    if report_df.empty:
+        return {"profit_factor": 0.0, "max_drawdown": 0.0}
+
+    gross_profit = report_df.loc[report_df["Net_PnL"] > 0, "Net_PnL"].sum()
+    gross_loss = abs(report_df.loc[report_df["Net_PnL"] < 0, "Net_PnL"].sum())
+    profit_factor = round(float(gross_profit / gross_loss), 2) if gross_loss > 0 else float("inf")
+    equity_curve = report_df["Net_PnL"].cumsum()
+    drawdown = equity_curve - equity_curve.cummax()
+    max_drawdown = round(float(abs(drawdown.min())), 2) if not drawdown.empty else 0.0
+    return {
+        "profit_factor": profit_factor,
+        "max_drawdown": max_drawdown,
+    }
+
+
+def run_profile_backtest(data_records, trading_profile):
+    trades = []
+    price_history = []
+    in_position = False
+    pos_type, entry_price, entry_time = "", 0.0, None
+    entry_data = {}
+    quantity = 0
+    stop_loss_price = None
+    target_price = None
+    current_day = None
+    daily_pnl = 0.0
+    daily_trading_paused = False
+
+    for i in range(29, len(data_records)):
+        row = data_records[i]
+        now_time, now_close = row["Datetime"], float(row["Close"])
+        params = risk_management()
+
+        if current_day != now_time.date():
+            if in_position and i > 0:
+                previous_close = float(data_records[i - 1]["Close"])
+                exit_price = previous_close * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
+                points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", params["brokerage_fee"]))
+                trades.append({
+                    "Trade_ID": f"{trading_profile.strategy_name.upper()}_{len(trades)+1}",
+                    "Entry_Time": entry_time,
+                    "Exit_Time": data_records[i - 1]["Datetime"],
+                    "Type": pos_type,
+                    "Qty": quantity,
+                    "Entry_Price": round(entry_price, 2),
+                    "Exit_Price": round(exit_price, 2),
+                    "Points": round(points, 2),
+                    "Net_PnL": round(net_pnl, 2),
+                    "Exit_Reason": "DAY_CLOSE",
+                    "Entry_RSI": entry_data.get("rsi"),
+                    "Entry_EMA_F": entry_data.get("ema_f"),
+                    "Exit_RSI": None,
+                    "Entry_Score": entry_data.get("entry_score"),
+                    "Strategy": trading_profile.strategy_name,
+                })
+            in_position = False
+            pos_type, entry_price, entry_time = "", 0.0, None
+            entry_data = {}
+            quantity = 0
+            stop_loss_price = None
+            target_price = None
+            current_day = now_time.date()
+            daily_pnl = 0.0
+            daily_trading_paused = False
+
+        price_history.append({
+            "DateTime": now_time,
+            "Price": now_close,
+            "High": float(row["High"]),
+            "Low": float(row["Low"]),
+            "Volume": float(row["Volume"]) if "Volume" in row else 0,
+            "Signal": None,
+            "RSI": None,
+            "RSI_FAST": None,
+            "EMA_FAST": None,
+            "SLOPE": None,
+            "PERCENT_B": None,
+            "ATR": None,
+            "Volume_Ratio": None,
+            "Entry_Score": None,
+            "REGIME": None,
+            "Strategy": trading_profile.strategy_name,
+            "Stop_Loss": stop_loss_price,
+            "Target": target_price,
+        })
+
+        recent_candles = get_recent_candles_from_records(data_records, i, lookback=60)
+        price_window = recent_candles["Close"].tolist()
+        signal_data = calculate_signals(
+            price_list=price_window,
+            current_time=now_time,
+            position=(1 if pos_type == "LONG" else -1) if in_position else 0,
+            entry_price=entry_price,
+            strategy_name=trading_profile.strategy_name,
+            candles_df=recent_candles,
+            capital=CONFIG["CAPITAL"],
+            lot_size=CONFIG["LOT_SIZE"],
+        )
+        action = signal_data.get("action", "WAIT")
+        price_history[-1].update({
+            "Signal": action,
+            "RSI": signal_data.get("rsi"),
+            "RSI_FAST": signal_data.get("rsi_fast"),
+            "EMA_FAST": signal_data.get("ema_f"),
+            "SLOPE": signal_data.get("slope"),
+            "PERCENT_B": signal_data.get("percent_b"),
+            "ATR": signal_data.get("atr"),
+            "Volume_Ratio": signal_data.get("volume_ratio"),
+            "Entry_Score": signal_data.get("entry_score"),
+            "REGIME": signal_data.get("regime"),
+            "Stop_Loss": stop_loss_price,
+            "Target": target_price,
+        })
+
+        if daily_pnl <= -get_daily_loss_limit_amount():
+            daily_trading_paused = True
+
+        if not in_position and action in ["BUY_LONG", "SELL_SHORT"] and (
+            daily_trading_paused or not trading_profile.permits_entry(action, now_time)
+        ):
+            action = "WAIT"
+
+        if not in_position and action in ["BUY_LONG", "SELL_SHORT"]:
+            quantity = int(signal_data.get("suggested_qty", CONFIG["LOT_SIZE"]))
+            in_position = True
+            pos_type = "LONG" if action == "BUY_LONG" else "SHORT"
+            entry_price = now_close * (1 + (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
+            entry_time = now_time
+            entry_data = signal_data
+            stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
+            continue
+
+        if not in_position:
+            continue
+
+        stop_loss_price = update_trailing_stop(now_close, entry_price, pos_type, stop_loss_price, entry_data)
+
+        exit_reason = None
+        if stop_loss_price is not None and ((pos_type == "LONG" and now_close <= stop_loss_price) or (pos_type == "SHORT" and now_close >= stop_loss_price)):
+            exit_reason = "EXIT_SL"
+        elif target_price is not None and ((pos_type == "LONG" and now_close >= target_price) or (pos_type == "SHORT" and now_close <= target_price)):
+            exit_reason = "EXIT_TARGET"
+        elif action.startswith("EXIT"):
+            exit_reason = action
+
+        if exit_reason is None:
+            continue
+
+        exit_price = now_close * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
+        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", params["brokerage_fee"]))
+        daily_pnl += net_pnl
+
+        trades.append({
+            "Trade_ID": f"{trading_profile.strategy_name.upper()}_{len(trades)+1}",
+            "Entry_Time": entry_time,
+            "Exit_Time": now_time,
+            "Type": pos_type,
+            "Qty": quantity,
+            "Entry_Price": round(entry_price, 2),
+            "Exit_Price": round(exit_price, 2),
+            "Points": round(points, 2),
+            "Net_PnL": round(net_pnl, 2),
+            "Exit_Reason": exit_reason,
+            "Entry_RSI": entry_data.get("rsi"),
+            "Entry_EMA_F": entry_data.get("ema_f"),
+            "Exit_RSI": signal_data.get("rsi"),
+            "Entry_Score": entry_data.get("entry_score"),
+            "Strategy": trading_profile.strategy_name,
+        })
+        in_position = False
+        pos_type = ""
+        entry_price = 0.0
+        entry_time = None
+        entry_data = {}
+        quantity = 0
+        stop_loss_price = None
+        target_price = None
+
+    if in_position and data_records:
+        final_close = float(data_records[-1]["Close"])
+        final_time = data_records[-1]["Datetime"]
+        exit_price = final_close * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
+        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", risk_management()["brokerage_fee"]))
+        trades.append({
+            "Trade_ID": f"{trading_profile.strategy_name.upper()}_{len(trades)+1}",
+            "Entry_Time": entry_time,
+            "Exit_Time": final_time,
+            "Type": pos_type,
+            "Qty": quantity,
+            "Entry_Price": round(entry_price, 2),
+            "Exit_Price": round(exit_price, 2),
+            "Points": round(points, 2),
+            "Net_PnL": round(net_pnl, 2),
+            "Exit_Reason": "BACKTEST_END",
+            "Entry_RSI": entry_data.get("rsi"),
+            "Entry_EMA_F": entry_data.get("ema_f"),
+            "Exit_RSI": None,
+            "Entry_Score": entry_data.get("entry_score"),
+            "Strategy": trading_profile.strategy_name,
+        })
+
+    report_df = build_trade_report_frame(trades)
+    total_pnl = round(report_df["Net_PnL"].sum(), 2) if not report_df.empty else 0.0
+    win_rate = round(((report_df["Net_PnL"] > 0).sum() / len(report_df)) * 100, 2) if not report_df.empty else 0.0
+    avg_pnl = round(report_df["Net_PnL"].mean(), 2) if not report_df.empty else 0.0
+
+    return {
+        "df": report_df,
+        "price_history_df": pd.DataFrame(price_history),
+        "total_pnl": total_pnl,
+        "trades": len(report_df),
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+        "stats": calculate_performance_stats(report_df),
+        "profile": trading_profile,
+    }
 
 def import_smart_api():
     try:
@@ -240,6 +841,32 @@ def get_live_price(smart_api, symbol, exchange, symbol_token):
     return None
 
 
+def fetch_backtest_market_data(symbol, start_dt, end_dt, interval="5m"):
+    chunk_frames = []
+    cursor = start_dt
+    chunk_days = 55 if interval.endswith("m") else 180
+
+    while cursor < end_dt:
+        chunk_end = min(cursor + timedelta(days=chunk_days), end_dt)
+        chunk = yf.download(
+            symbol,
+            start=cursor.strftime("%Y-%m-%d"),
+            end=chunk_end.strftime("%Y-%m-%d"),
+            interval=interval,
+            progress=False,
+        )
+        if not chunk.empty:
+            chunk_frames.append(chunk)
+        cursor = chunk_end
+
+    if not chunk_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(chunk_frames)
+    combined = combined[~combined.index.duplicated(keep="last")]
+    return combined.sort_index()
+
+
 def finalize_trading_session(trades, price_history, trade_path, price_path, source_label):
     if trades:
         report_df, price_history_df = save_trade_and_price_files(trades, price_history, trade_path, price_path)
@@ -304,22 +931,31 @@ def run_live_trading():
 
     print("✅ Angel One login successful")
     print(f"📡 Using Angel market data for {CONFIG['MARKET_DATA_SYMBOL']} ({CONFIG['MARKET_DATA_INTERVAL']})")
-    strategy_name = get_forward_strategy_name()
-    print(f"🧠 Active forward strategy: {strategy_name}")
+    trading_profile = resolve_trading_profile()
+    strategy_name = trading_profile.strategy_name
+    print(f"🧠 Active forward profile: {trading_profile.describe()} [{trading_profile.source}]")
 
     trades = []
     price_history = []
     in_position = False
     pos_type, entry_price, entry_time = "", 0.0, None
     entry_data = {}
+    quantity = 0
     stop_loss_price = None
     target_price = None
     last_candle_time = None
+    session_date = None
+    daily_pnl = 0.0
+    daily_trading_paused = False
 
     try:
         while True:
             now = datetime.now()
             market_open, market_close = get_market_window(now)
+            if now.weekday() < 5 and session_date != now.date():
+                session_date = now.date()
+                daily_pnl = 0.0
+                daily_trading_paused = False
 
             if now >= market_close:
                 print("🏁 Market closed. Sending final report...")
@@ -332,13 +968,13 @@ def run_live_trading():
                     )
                     if current_price is not None:
                         exit_price = calculate_exit_price(current_price, pos_type == "LONG", CONFIG['SLIPPAGE_BPS'])
-                        points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
-                        net_pnl = (points * CONFIG['LOT_SIZE']) - risk_management()['brokerage_fee']
+                        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", risk_management()['brokerage_fee']))
                         trades.append({
                             "Trade_ID": f"ANGEL_{len(trades)+1}",
                             "Entry_Time": entry_time,
                             "Exit_Time": now,
                             "Type": pos_type,
+                            "Qty": quantity or CONFIG["LOT_SIZE"],
                             "Entry_Price": round(entry_price, 2),
                             "Exit_Price": round(exit_price, 2),
                             "Points": round(points, 2),
@@ -347,6 +983,7 @@ def run_live_trading():
                             "Entry_RSI": entry_data.get('rsi'),
                             "Entry_EMA_F": entry_data.get('ema_f'),
                             "Exit_RSI": None,
+                            "Entry_Score": entry_data.get("entry_score"),
                             "Strategy": strategy_name
                         })
                 finalize_trading_session(trades, price_history, CONFIG['OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'], "LIVE TRADING")
@@ -388,7 +1025,8 @@ def run_live_trading():
                 if current_price is None:
                     current_price = float(df['Close'].iloc[-1])
 
-                price_window = df['Close'].tail(26).tolist()
+                recent_candles = get_recent_candles_from_market_df(df, lookback=60)
+                price_window = recent_candles['Close'].tolist()
                 risk = risk_management()
                 position_flag = 1 if pos_type == "LONG" else -1 if pos_type == "SHORT" else 0
                 signal_data = calculate_signals(
@@ -396,22 +1034,18 @@ def run_live_trading():
                     current_time=current_time,
                     position=position_flag,
                     entry_price=entry_price,
-                    strategy_name=strategy_name
+                    strategy_name=strategy_name,
+                    candles_df=recent_candles,
+                    capital=CONFIG["CAPITAL"],
+                    lot_size=CONFIG["LOT_SIZE"],
                 )
                 action = signal_data.get('action', 'WAIT')
                 is_new_candle = current_time != last_candle_time
+                if daily_pnl <= -get_daily_loss_limit_amount():
+                    daily_trading_paused = True
 
                 if in_position:
-                    pnl_pct = ((current_price - entry_price) / entry_price) if pos_type == "LONG" else ((entry_price - current_price) / entry_price)
-                    if pnl_pct >= risk['breakeven_pct']:
-                        if pos_type == "LONG":
-                            stop_loss_price = max(stop_loss_price or entry_price, entry_price)
-                            trail_price = entry_price * (1 + risk['trail_distance'])
-                            stop_loss_price = max(stop_loss_price, trail_price)
-                        else:
-                            stop_loss_price = min(stop_loss_price or entry_price, entry_price)
-                            trail_price = entry_price * (1 - risk['trail_distance'])
-                            stop_loss_price = min(stop_loss_price, trail_price)
+                    stop_loss_price = update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data)
 
                     exit_reason = None
                     if stop_loss_price is not None:
@@ -425,13 +1059,14 @@ def run_live_trading():
 
                     if exit_reason is not None:
                         exit_price = calculate_exit_price(current_price, pos_type == "LONG", CONFIG['SLIPPAGE_BPS'])
-                        points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
-                        net_pnl = (points * CONFIG['LOT_SIZE']) - risk['brokerage_fee']
+                        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", risk['brokerage_fee']))
+                        daily_pnl += net_pnl
                         trades.append({
                             "Trade_ID": f"ANGEL_{len(trades)+1}",
                             "Entry_Time": entry_time,
                             "Exit_Time": now,
                             "Type": pos_type,
+                            "Qty": quantity or CONFIG["LOT_SIZE"],
                             "Entry_Price": round(entry_price, 2),
                             "Exit_Price": round(exit_price, 2),
                             "Points": round(points, 2),
@@ -440,6 +1075,7 @@ def run_live_trading():
                             "Entry_RSI": entry_data.get('rsi'),
                             "Entry_EMA_F": entry_data.get('ema_f'),
                             "Exit_RSI": signal_data.get('rsi'),
+                            "Entry_Score": entry_data.get("entry_score"),
                             "Strategy": strategy_name
                         })
 
@@ -463,6 +1099,7 @@ def run_live_trading():
                         entry_price = 0.0
                         entry_time = None
                         entry_data = {}
+                        quantity = 0
                         stop_loss_price = None
                         target_price = None
 
@@ -480,6 +1117,9 @@ def run_live_trading():
                         "EMA_FAST": signal_data.get('ema_f'),
                         "SLOPE": signal_data.get('slope'),
                         "PERCENT_B": signal_data.get('percent_b') if 'percent_b' in signal_data else None,
+                        "ATR": signal_data.get("atr"),
+                        "Volume_Ratio": signal_data.get("volume_ratio"),
+                        "Entry_Score": signal_data.get("entry_score"),
                         "REGIME": signal_data.get('regime'),
                         "Strategy": strategy_name,
                         "Stop_Loss": stop_loss_price,
@@ -487,32 +1127,33 @@ def run_live_trading():
                     })
                     last_candle_time = current_time
 
-                if not in_position and is_new_candle and action in ["BUY_LONG", "SELL_SHORT"]:
+                if not in_position and is_new_candle and action in ["BUY_LONG", "SELL_SHORT"] and not daily_trading_paused and trading_profile.permits_entry(action, current_time):
                     pos_type = "LONG" if action == "BUY_LONG" else "SHORT"
+                    quantity = int(signal_data.get("suggested_qty", CONFIG["LOT_SIZE"]))
                     entry_price = current_price * (1 + (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
                     entry_time = now
                     entry_data = signal_data
-                    stop_loss_price = entry_price * (1 - risk['stop_loss_pct']) if pos_type == "LONG" else entry_price * (1 + risk['stop_loss_pct'])
-                    target_price = entry_price * (1 + risk['target_pct_3']) if pos_type == "LONG" else entry_price * (1 - risk['target_pct_3'])
+                    stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
                     side = "BUY" if pos_type == "LONG" else "SELL"
                     order_response = place_order(
                         smart_api,
                         CONFIG["TRADE_SYMBOL"],
                         side,
-                        CONFIG['LOT_SIZE'],
+                        quantity,
                         entry_price,
                         exchange=CONFIG["TRADE_EXCHANGE"],
                         symbol_token=CONFIG["TRADE_SYMBOL_TOKEN"],
                     )
                     if order_response:
                         in_position = True
-                        print(f"✅ Entered {pos_type} on {CONFIG['TRADE_SYMBOL']} at {entry_price:.2f} | SL {stop_loss_price:.2f} | Target {target_price:.2f}")
+                        print(f"✅ Entered {pos_type} on {CONFIG['TRADE_SYMBOL']} at {entry_price:.2f} | Qty {quantity} | SL {stop_loss_price:.2f} | Target {target_price:.2f}")
                     else:
                         print("❌ Live entry failed. Waiting for next signal.")
                         pos_type = ""
                         entry_price = 0.0
                         entry_time = None
                         entry_data = {}
+                        quantity = 0
                         stop_loss_price = None
                         target_price = None
 
@@ -565,17 +1206,21 @@ def run_paper_trading():
         return
 
     print("✅ Angel One login successful")
-    strategy_name = get_forward_strategy_name()
-    print(f"🧠 Active forward strategy: {strategy_name}")
+    trading_profile = resolve_trading_profile()
+    strategy_name = trading_profile.strategy_name
+    print(f"🧠 Active forward profile: {trading_profile.describe()} [{trading_profile.source}]")
     trades = []
     price_history = []
     in_position = False
     pos_type, entry_price, entry_time = "", 0.0, None
     entry_data = {}
+    quantity = 0
     stop_loss_price = None
     target_price = None
     last_candle_time = None
     session_date = None
+    daily_pnl = 0.0
+    daily_trading_paused = False
 
     try:
         while True:
@@ -583,6 +1228,8 @@ def run_paper_trading():
             if now.weekday() < 5 and session_date != now.date():
                 reset_paper_session_files(now.date())
                 session_date = now.date()
+                daily_pnl = 0.0
+                daily_trading_paused = False
             market_open, market_close = get_market_window(now)
 
             if now >= market_close:
@@ -597,13 +1244,13 @@ def run_paper_trading():
                     if current_price is not None:
                         params = risk_management()
                         exit_price = current_price * (1 - (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
-                        points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
-                        net_pnl = (points * CONFIG['LOT_SIZE']) - params['brokerage_fee']
+                        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", params['brokerage_fee']))
                         trades.append({
                             "Trade_ID": f"PAPER_{len(trades)+1}",
                             "Entry_Time": entry_time,
                             "Exit_Time": now,
                             "Type": pos_type,
+                            "Qty": quantity or CONFIG["LOT_SIZE"],
                             "Entry_Price": round(entry_price, 2),
                             "Exit_Price": round(exit_price, 2),
                             "Points": round(points, 2),
@@ -612,6 +1259,7 @@ def run_paper_trading():
                             "Entry_RSI": entry_data.get('rsi'),
                             "Entry_EMA_F": entry_data.get('ema_f'),
                             "Exit_RSI": None,
+                            "Entry_Score": entry_data.get("entry_score"),
                             "Strategy": strategy_name
                         })
                         print(f"🔴 Paper exit simulated: {pos_type} closed at {exit_price:.2f} @ {now:%Y-%m-%d %H:%M} | PnL: ₹{net_pnl:.2f} (MARKET_CLOSE)")
@@ -655,26 +1303,25 @@ def run_paper_trading():
                     current_price = float(df['Close'].iloc[-1])
 
                 params = risk_management()
-                price_window = df['Close'].tail(26).tolist()
+                recent_candles = get_recent_candles_from_market_df(df, lookback=60)
+                price_window = recent_candles['Close'].tolist()
                 signal_data = calculate_signals(
                     price_list=price_window,
                     current_time=current_time,
                     position=(1 if pos_type == "LONG" else -1) if in_position else 0,
                     entry_price=entry_price,
-                    strategy_name=strategy_name
+                    strategy_name=strategy_name,
+                    candles_df=recent_candles,
+                    capital=CONFIG["CAPITAL"],
+                    lot_size=CONFIG["LOT_SIZE"],
                 )
                 action = signal_data.get('action', 'WAIT')
                 is_new_candle = current_time != last_candle_time
+                if daily_pnl <= -get_daily_loss_limit_amount():
+                    daily_trading_paused = True
 
                 if in_position:
-                    pnl_pct = ((current_price - entry_price) / entry_price) if pos_type == "LONG" else ((entry_price - current_price) / entry_price)
-                    if pnl_pct >= params['breakeven_pct']:
-                        if pos_type == "LONG":
-                            stop_loss_price = max(stop_loss_price or entry_price, entry_price)
-                            stop_loss_price = max(stop_loss_price, entry_price * (1 + params['trail_distance']))
-                        else:
-                            stop_loss_price = min(stop_loss_price or entry_price, entry_price)
-                            stop_loss_price = min(stop_loss_price, entry_price * (1 - params['trail_distance']))
+                    stop_loss_price = update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data)
 
                 if is_new_candle:
                     candle = df.iloc[-1]
@@ -690,6 +1337,9 @@ def run_paper_trading():
                         "EMA_FAST": signal_data.get('ema_f'),
                         "SLOPE": signal_data.get('slope'),
                         "PERCENT_B": signal_data.get('percent_b') if 'percent_b' in signal_data else None,
+                        "ATR": signal_data.get("atr"),
+                        "Volume_Ratio": signal_data.get("volume_ratio"),
+                        "Entry_Score": signal_data.get("entry_score"),
                         "REGIME": signal_data.get('regime'),
                         "Strategy": strategy_name,
                         "Stop_Loss": stop_loss_price,
@@ -707,27 +1357,28 @@ def run_paper_trading():
                     elif is_new_candle and action.startswith("EXIT"):
                         exit_reason = action
 
-                if not in_position and is_new_candle and action in ["BUY_LONG", "SELL_SHORT"]:
+                if not in_position and is_new_candle and action in ["BUY_LONG", "SELL_SHORT"] and not daily_trading_paused and trading_profile.permits_entry(action, current_time):
                     pos_type = "LONG" if action == "BUY_LONG" else "SHORT"
+                    quantity = int(signal_data.get("suggested_qty", CONFIG["LOT_SIZE"]))
                     entry_price = current_price * (1 + (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
                     entry_time = now
                     entry_data = signal_data
-                    stop_loss_price = entry_price * (1 - params['stop_loss_pct']) if pos_type == "LONG" else entry_price * (1 + params['stop_loss_pct'])
-                    target_price = entry_price * (1 + params['target_pct_3']) if pos_type == "LONG" else entry_price * (1 - params['target_pct_3'])
+                    stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
                     in_position = True
-                    print(f"🟢 Paper entry simulated: {pos_type} at {entry_price:.2f} | SL {stop_loss_price:.2f} | Target {target_price:.2f}")
+                    print(f"🟢 Paper entry simulated: {pos_type} at {entry_price:.2f} | Qty {quantity} | SL {stop_loss_price:.2f} | Target {target_price:.2f}")
                     time.sleep(CONFIG["MARKET_POLL_SECONDS"])
                     continue
 
                 if in_position and exit_reason is not None:
                     exit_price = current_price * (1 - (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
-                    points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
-                    net_pnl = (points * CONFIG['LOT_SIZE']) - params['brokerage_fee']
+                    points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", params['brokerage_fee']))
+                    daily_pnl += net_pnl
                     trades.append({
                         "Trade_ID": f"PAPER_{len(trades)+1}",
                         "Entry_Time": entry_time,
                         "Exit_Time": now,
                         "Type": pos_type,
+                        "Qty": quantity or CONFIG["LOT_SIZE"],
                         "Entry_Price": round(entry_price, 2),
                         "Exit_Price": round(exit_price, 2),
                         "Points": round(points, 2),
@@ -736,6 +1387,7 @@ def run_paper_trading():
                         "Entry_RSI": entry_data.get('rsi'),
                         "Entry_EMA_F": entry_data.get('ema_f'),
                         "Exit_RSI": signal_data.get('rsi'),
+                        "Entry_Score": entry_data.get("entry_score"),
                         "Strategy": strategy_name
                     })
                     print(f"🔴 Paper exit simulated: {pos_type} closed at {exit_price:.2f} @ {now:%Y-%m-%d %H:%M} | PnL: ₹{net_pnl:.2f} ({exit_reason})")
@@ -745,6 +1397,7 @@ def run_paper_trading():
                     entry_price = 0.0
                     entry_time = None
                     entry_data = {}
+                    quantity = 0
                     stop_loss_price = None
                     target_price = None
 
@@ -757,9 +1410,14 @@ def run_paper_trading():
 
 
 def run_angel_backtest():
-    start_date = (datetime.now() - timedelta(days=58)).strftime('%Y-%m-%d')
-    print(f"📡 Fetching data for {CONFIG['SYMBOL']} from {start_date}...")
-    df = yf.download(CONFIG['SYMBOL'], start=start_date, interval="5m")
+    end_dt = datetime.now()
+    requested_start_dt = end_dt - timedelta(days=180)
+    intraday_start_dt = max(requested_start_dt, end_dt - timedelta(days=55))
+    if intraday_start_dt > requested_start_dt:
+        print("ℹ️  Yahoo 5-minute data is limited to about the last 60 days. Falling back to the latest 55 days.")
+    start_dt = intraday_start_dt
+    print(f"📡 Fetching data for {CONFIG['SYMBOL']} from {start_dt.strftime('%Y-%m-%d')}...")
+    df = fetch_backtest_market_data(CONFIG['SYMBOL'], start_dt, end_dt, interval="5m")
     
     if df.empty:
         print("❌ Data is empty")
@@ -772,154 +1430,62 @@ def run_angel_backtest():
 
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     data_records = df.reset_index().to_dict('records')
-    
-    print(f"\n📊 Running backtests with 4 strategies on {len(data_records)} candles...")
-    
+
+    print(f"\n📊 Running execution-aligned profile backtests on {len(data_records)} candles...")
+
+    configured_profile = build_default_trading_profile()
+    adaptive_profile = resolve_trading_profile()
+
+    configured_results = run_profile_backtest(data_records, configured_profile)
+    adaptive_results = run_profile_backtest(data_records, adaptive_profile)
+
+    profile_results = [
+        ("CONFIGURED_PROFILE", configured_results),
+    ]
+    if adaptive_profile != configured_profile:
+        profile_results.append(("ADAPTIVE_PROFILE", adaptive_results))
+
+    for label, results in profile_results:
+        profile = results["profile"]
+        stats = results["stats"]
+        print(
+            f"  {label}: {profile.describe()} | "
+            f"{results['trades']} trades | Total PnL: ₹{results['total_pnl']:,.2f} | "
+            f"Win Rate: {results['win_rate']:.1f}% | "
+            f"Profit Factor: {stats['profit_factor']} | Max DD: ₹{stats['max_drawdown']:,.2f}"
+        )
+        output_file = f"{label.lower()}_backtest_results.csv"
+        results["df"].to_csv(output_file, index=False)
+
+    adaptive_results["price_history_df"].to_csv(CONFIG["PRICE_HISTORY_FILE"], index=False)
+
+    print("\n📊 Diagnostic unrestricted strategy comparison:")
     all_strategies_results = {}
     best_strategy = None
-    best_pnl = -float('inf')
-    
-    strategies = ["strategy_1", "strategy_2", "strategy_3", "strategy_4"]
-    
-    for strategy_name in strategies:
-        trades = []
-        price_history = []
-        in_position = False
-        pos_type, entry_price, entry_time = "", 0.0, None
-        daily_pnl, current_day = 0, None
-        entry_data = {}
-        stop_loss_price = None
-        target_price = None
+    best_pnl = -float("inf")
 
-        for i in range(30, len(data_records)):
-            params = risk_management()
-            row = data_records[i]
-            now_time, now_close = row['Datetime'], float(row['Close'])
-            
-            price_history.append({
-                "DateTime": now_time,
-                "Price": now_close,
-                "High": float(row['High']),
-                "Low": float(row['Low']),
-                "Volume": float(row['Volume']) if 'Volume' in row else 0
-            })
-            
-            if current_day != now_time.date():
-                if in_position and i > 0:
-                    trades.append({
-                        "Trade_ID": f"{strategy_name.upper()}_{len(trades)+1}", 
-                        "Entry_Time": entry_time, 
-                        "Exit_Time": data_records[i-1]['Datetime'],
-                        "Type": pos_type, 
-                        "Entry_Price": round(entry_price, 2), 
-                        "Exit_Price": round(data_records[i-1]['Close'], 2),
-                        "Net_PnL": round(((data_records[i-1]['Close'] - entry_price) if pos_type == "LONG" else (entry_price - data_records[i-1]['Close'])) * CONFIG['LOT_SIZE'] - params['brokerage_fee'], 2),
-                        "Exit_Reason": "GAP_PROTECTION", 
-                        "Entry_RSI": entry_data.get('rsi'), 
-                        "Entry_EMA_F": entry_data.get('ema_f'),
-                        "Strategy": strategy_name
-                    })
-                    in_position = False
-                current_day, daily_pnl = now_time.date(), 0
+    for strategy_name in ["strategy_1", "strategy_2", "strategy_3", "strategy_4"]:
+        unrestricted_profile = TradingProfile(strategy_name=strategy_name, source="backtest")
+        results = run_profile_backtest(data_records, unrestricted_profile)
+        all_strategies_results[strategy_name] = results
 
-            price_window = [r['Close'] for r in data_records[max(0, i-25):i+1]]
-            signal_data = calculate_signals(
-                price_list=price_window, 
-                current_time=now_time, 
-                position=(1 if pos_type == "LONG" else -1) if in_position else 0, 
-                entry_price=entry_price,
-                strategy_name=strategy_name
+        if results["trades"] > 0:
+            stats = results["stats"]
+            print(
+                f"  {strategy_name.upper()}: {results['trades']} trades | "
+                f"Total PnL: ₹{results['total_pnl']:,.2f} | Win Rate: {results['win_rate']:.1f}% | "
+                f"Profit Factor: {stats['profit_factor']} | Max DD: ₹{stats['max_drawdown']:,.2f}"
             )
-            
-            action = signal_data.get('action', 'WAIT')
-
-            if not in_position and action in ["BUY_LONG", "SELL_SHORT"]:
-                in_position = True
-                pos_type = "LONG" if "BUY" in action else "SHORT"
-                entry_price = now_close * (1 + (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
-                entry_time = now_time
-                entry_data = signal_data
-                stop_loss_price = entry_price * (1 - params['stop_loss_pct']) if pos_type == "LONG" else entry_price * (1 + params['stop_loss_pct'])
-                target_price = entry_price * (1 + params['target_pct_3']) if pos_type == "LONG" else entry_price * (1 - params['target_pct_3'])
-            
-            elif in_position:
-                pnl_pct = ((now_close - entry_price) / entry_price) if pos_type == "LONG" else ((entry_price - now_close) / entry_price)
-                if pnl_pct >= params['breakeven_pct']:
-                    if pos_type == "LONG":
-                        stop_loss_price = max(stop_loss_price or entry_price, entry_price)
-                        stop_loss_price = max(stop_loss_price, entry_price * (1 + params['trail_distance']))
-                    else:
-                        stop_loss_price = min(stop_loss_price or entry_price, entry_price)
-                        stop_loss_price = min(stop_loss_price, entry_price * (1 - params['trail_distance']))
-
-                exit_reason = None
-                if stop_loss_price is not None and ((pos_type == "LONG" and now_close <= stop_loss_price) or (pos_type == "SHORT" and now_close >= stop_loss_price)):
-                    exit_reason = "EXIT_SL"
-                elif target_price is not None and ((pos_type == "LONG" and now_close >= target_price) or (pos_type == "SHORT" and now_close <= target_price)):
-                    exit_reason = "EXIT_TARGET"
-                elif action.startswith("EXIT"):
-                    exit_reason = action
-
-                if exit_reason is not None:
-                    exit_price = now_close * (1 - (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
-                    points = (exit_price - entry_price) if pos_type == "LONG" else (entry_price - exit_price)
-                    net_pnl = (points * CONFIG['LOT_SIZE']) - params['brokerage_fee']
-                    daily_pnl += net_pnl
-                    
-                    trades.append({
-                        "Trade_ID": f"{strategy_name.upper()}_{len(trades)+1}",
-                        "Entry_Time": entry_time,
-                        "Exit_Time": now_time,
-                        "Type": pos_type,
-                        "Entry_Price": round(entry_price, 2),
-                        "Exit_Price": round(exit_price, 2),
-                        "Points": round(points, 2),
-                        "Net_PnL": round(net_pnl, 2),
-                        "Exit_Reason": exit_reason,
-                        "Entry_RSI": entry_data.get('rsi'),
-                        "Entry_EMA_F": entry_data.get('ema_f'),
-                        "Exit_RSI": signal_data.get('rsi'),
-                        "Strategy": strategy_name
-                    })
-                    in_position = False
-
-        if trades:
-            report_df = pd.DataFrame(trades)
-            total_pnl = report_df['Net_PnL'].sum()
-            win_rate = (report_df['Net_PnL'] > 0).sum() / len(report_df) * 100
-            
-            all_strategies_results[strategy_name] = {
-                "df": report_df,
-                "total_pnl": total_pnl,
-                "trades": len(report_df),
-                "win_rate": win_rate,
-                "avg_pnl": report_df['Net_PnL'].mean()
-            }
-            
-            print(f"  {strategy_name.upper()}: {len(report_df)} trades | Total PnL: ₹{total_pnl:,.2f} | Win Rate: {win_rate:.1f}%")
-            
-            if total_pnl > best_pnl:
-                best_pnl = total_pnl
+            if results["total_pnl"] > best_pnl:
+                best_pnl = results["total_pnl"]
                 best_strategy = strategy_name
         else:
             print(f"  {strategy_name.upper()}: No trades generated")
-            all_strategies_results[strategy_name] = {"df": None, "total_pnl": 0, "trades": 0, "win_rate": 0, "avg_pnl": 0}
 
-    # Save results for all strategies
-    for strategy_name, results in all_strategies_results.items():
-        if results["df"] is not None:
-            output_file = f"{strategy_name}_backtest_results.csv"
-            results["df"].to_csv(output_file, index=False)
-    
-    # Save price history (same for all strategies)
-    price_history_df = pd.DataFrame(price_history)
-    price_history_df.to_csv(CONFIG['PRICE_HISTORY_FILE'], index=False)
-    
-    print(f"\n🏆 BEST STRATEGY: {best_strategy.upper()} with ₹{best_pnl:,.2f} PnL")
-    print(f"   📊 View individual results:")
-    for strategy_name, results in all_strategies_results.items():
-        if results["trades"] > 0:
-            print(f"      - {strategy_name.upper()}: {results['trades']} trades, ₹{results['total_pnl']:,.2f} PnL, {results['win_rate']:.1f}% win rate")
+        results["df"].to_csv(f"{strategy_name}_backtest_results.csv", index=False)
+
+    if best_strategy is not None:
+        print(f"\n🏆 BEST UNRESTRICTED STRATEGY: {best_strategy.upper()} with ₹{best_pnl:,.2f} PnL")
 
 if __name__ == "__main__":
     if CONFIG['LIVE_MODE']:
