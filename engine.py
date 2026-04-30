@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+STRATEGIES = ["strategy_1", "strategy_2", "strategy_3", "strategy_4"]
 
 # ==============================
 # SAFE DATA BUILDER (CORE FIX)
