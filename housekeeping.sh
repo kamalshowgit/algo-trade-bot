@@ -1,8 +1,12 @@
 #!/bin/bash
 cd /home/ubuntu/trading_bot
 
+TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+
 # Move old logs to a compressed archive to save space
+echo -e "\n=== ARCHIVED ON $TIMESTAMP ===" >> logs/historical_archive.log
 cat logs/out.log >> logs/historical_archive.log
+echo -e "\n=== ARCHIVED ON $TIMESTAMP ===" >> logs/historical_err_archive.log
 cat logs/err.log >> logs/historical_err_archive.log
 
 # Wipe the active files to zero bytes

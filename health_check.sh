@@ -65,7 +65,7 @@ if [ -f ".env" ]; then
         check_warn "RECEIVER_EMAIL not configured"
     fi
     
-    if grep -q "APP_PASSWORD" .env; then
+    if grep -qE "APP_PASSWORD|EMAIL_PASSWORD|GMAIL_APP_PASSWORD" .env; then
         check_pass "APP_PASSWORD configured"
     else
         check_fail "APP_PASSWORD not configured (email won't work)"

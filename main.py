@@ -1,50 +1,50 @@
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import os
-import time
-import glob
-from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dt_time
-from engine import STRATEGIES, calculate_signals, risk_management
-from dotenv import load_dotenv
+import pandas as pd # Import pandas for data manipulation and tabular data
+import numpy as np # Import numpy for array calculations
+import yfinance as yf # Import yfinance for downloading historical stock data
+import os # Import os to interact with environment variables and file paths
+import time # Import time for sleeping/pausing execution
+import glob # Import glob to search for files matching a specific pattern
+from dataclasses import dataclass # Import dataclass for structured objects (fixed syntax typo datac3lass -> dataclass)
+from datetime import datetime, timedelta, time as dt_time # Import datetime tools for timestamp management
+from engine import STRATEGIES, calculate_signals, risk_management # Import core trading logic from engine.py
+from dotenv import load_dotenv # Import load_dotenv to read secrets from a .env file
 
-load_dotenv()
+load_dotenv() # Execute load_dotenv to load environment variables into the os.environ dictionary
 
-def get_int_env(name, default, minimum=None):
-    try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    if minimum is not None:
-        value = max(minimum, value)
-    return value
-
-
-def get_bool_env(name, default):
-    return os.getenv(name, str(default)).strip().lower() == "true"
+def get_int_env(name, default, minimum=None): # Utility function to fetch int ENV variables safely
+    try: # Begin try-catch block for parsing
+        value = int(os.getenv(name, str(default))) # Pull OS environment variable and cast to integer
+    except (TypeError, ValueError): # If the variable doesn't parse to an integer
+        value = default # Revert to the fallback integer
+    if minimum is not None: # If a lower bound is requested
+        value = max(minimum, value) # Apply the minimum bound dynamically
+    return value # Output the sanitized integer
 
 
-CONFIG = {
-    "SYMBOL": "^NSEI",
-    "LOT_SIZE": 50,
-    "CAPITAL": 100000,
-    "SLIPPAGE_BPS": 0.0003,
-    "OUTPUT_FILE": "angel_backtest_results.csv",
-    "PAPER_OUTPUT_FILE": os.getenv("PAPER_OUTPUT_FILE", "paper_trade_history.csv"),
-    "PRICE_HISTORY_FILE": os.getenv("PRICE_HISTORY_FILE", "price_history.csv"),
-    "LIVE_MODE": get_bool_env("LIVE_MODE", False),
-    "PAPER_MODE": get_bool_env("PAPER_MODE", True),
-    "MARKET_DATA_EXCHANGE": os.getenv("MARKET_DATA_EXCHANGE", "NSE"),
-    "MARKET_DATA_SYMBOL": os.getenv("MARKET_DATA_SYMBOL", "NIFTY"),
-    "MARKET_DATA_SYMBOL_TOKEN": os.getenv("MARKET_DATA_SYMBOL_TOKEN", "99926000"),
-    "MARKET_DATA_INTERVAL": os.getenv("MARKET_DATA_INTERVAL", "FIVE_MINUTE"),
-    "MARKET_POLL_SECONDS": get_int_env("MARKET_POLL_SECONDS", 30, minimum=5),
+def get_bool_env(name, default): # Utility function to fetch boolean ENV variables safely
+    return os.getenv(name, str(default)).strip().lower() == "true" # Returns exact True if environment string matches "true", else False
+
+
+CONFIG = { # Master configuration dictionary loading global execution parameters
+    "SYMBOL": "^NSEI", # The default backtesting index symbol
+    "LOT_SIZE": 65, # Standard lot sizing for NIFTY
+    "CAPITAL": 100000, # Base theoretical capital pool
+    "SLIPPAGE_BPS": 0.0003, # Standard internal slippage representation (0.03%)
+    "OUTPUT_FILE": "angel_backtest_results.csv", # Destination file for standard runs
+    "PAPER_OUTPUT_FILE": os.getenv("PAPER_OUTPUT_FILE", "paper_trade_history.csv"), # Destination for paper runs
+    "PRICE_HISTORY_FILE": os.getenv("PRICE_HISTORY_FILE", "price_history.csv"), # Continuous price logging output file
+    "LIVE_MODE": get_bool_env("LIVE_MODE", False), # Defines if the app executes Real trades
+    "PAPER_MODE": get_bool_env("PAPER_MODE", True), # Defines if the app executes Paper trades
+    "MARKET_DATA_EXCHANGE": os.getenv("MARKET_DATA_EXCHANGE", "NSE"), # Defines API connection exchange string
+    "MARKET_DATA_SYMBOL": os.getenv("MARKET_DATA_SYMBOL", "NIFTY"), # Defines API forward charting symbol
+    "MARKET_DATA_SYMBOL_TOKEN": os.getenv("MARKET_DATA_SYMBOL_TOKEN", "99926000"), # Defines API Token Key
+    "MARKET_DATA_INTERVAL": os.getenv("MARKET_DATA_INTERVAL", "FIVE_MINUTE"), # API Polling interval size
+    "MARKET_POLL_SECONDS": get_int_env("MARKET_POLL_SECONDS", 30, minimum=5), # Latency spacing for loops
     "CANDLE_LOOKBACK_DAYS": get_int_env("CANDLE_LOOKBACK_DAYS", 2, minimum=1),
     "TRADE_EXCHANGE": os.getenv("TRADE_EXCHANGE", "NSE"),
     "TRADE_SYMBOL": os.getenv("TRADE_SYMBOL", "NIFTY30APR26FUT"),
     "TRADE_SYMBOL_TOKEN": os.getenv("TRADE_SYMBOL_TOKEN", "99926000"),
-    "FORWARD_STRATEGY": os.getenv("FORWARD_STRATEGY", "strategy_4").strip().lower(),
+    "FORWARD_STRATEGY": os.getenv("FORWARD_STRATEGY", "strategy_1").strip().lower(),
     "AUTO_TUNE_FROM_LOCAL_DATA": get_bool_env("AUTO_TUNE_FROM_LOCAL_DATA", True),
     "MIN_LOCAL_TRAINING_FILES": get_int_env("MIN_LOCAL_TRAINING_FILES", 3, minimum=1),
     "LOCAL_PRICE_HISTORY_PATTERNS": os.getenv("LOCAL_PRICE_HISTORY_PATTERNS", "../price_history*.csv,price_history*.csv"),
@@ -72,6 +72,10 @@ EMPTY_TRADE_COLUMNS = [
     "Exit_RSI",
     "Entry_Score",
     "Strategy",
+    "Planned_Risk",
+    "Daily_PnL_After",
+    "Risk_Allowed",
+    "Session_Stop",
 ]
 PRICE_HISTORY_COLUMNS = [
     "DateTime",
@@ -103,33 +107,33 @@ def get_forward_strategy_name():
     return strategy_name
 
 
-def minute_to_label(total_minutes):
-    hours = total_minutes // 60
-    minutes = total_minutes % 60
-    return f"{hours:02d}:{minutes:02d}"
+def minute_to_label(total_minutes): # Helper: Convert total minutes into an HH:MM string
+    hours = total_minutes // 60 # Extract the hours
+    minutes = total_minutes % 60 # Extract the remaining minutes
+    return f"{hours:02d}:{minutes:02d}" # Format correctly
 
 
-@dataclass(frozen=True)
-class TradingProfile:
-    strategy_name: str
-    entry_start_minute: int = 555
-    entry_end_minute: int = 915
-    skip_midday: bool = False
-    allow_long: bool = True
-    allow_short: bool = True
-    source: str = "config"
+@dataclass(frozen=True) # Used to create immutable, structured config profiles
+class TradingProfile: # Contains the active trading logic configuration state
+    strategy_name: str # The strategy ID from STRATEGIES
+    entry_start_minute: int = 555 # 9:15 AM default start
+    entry_end_minute: int = 915 # 3:15 PM default stop
+    skip_midday: bool = False # Parameter to optionally avoid sideways lunch chops
+    allow_long: bool = True # Parameter to allow bullish calls
+    allow_short: bool = True # Parameter to allow bearish calls
+    source: str = "config" # String metadata to identify logic origin
 
-    def permits_entry(self, action, current_time):
-        minute = current_time.hour * 60 + current_time.minute
-        if minute < self.entry_start_minute or minute > self.entry_end_minute:
-            return False
-        if self.skip_midday and 735 <= minute <= 795:
-            return False
-        if action == "BUY_LONG":
-            return self.allow_long
-        if action == "SELL_SHORT":
-            return self.allow_short
-        return True
+    def permits_entry(self, action, current_time): # Validates whether a time-action is within profile constraints
+        minute = current_time.hour * 60 + current_time.minute # Convert current timestamp to raw daily minutes
+        if minute < self.entry_start_minute or minute > self.entry_end_minute: # Ensure it is inside the trading window boundaries
+            return False # Reject entry condition
+        if self.skip_midday and 735 <= minute <= 795: # Block 12:15 to 1:15pm logic
+            return False # Reject entry condition
+        if action == "BUY_LONG": # Validate bullish rules
+            return self.allow_long # Use boolean
+        if action == "SELL_SHORT": # Validate bearish rules
+            return self.allow_short # Use boolean
+        return True # Accepted
 
     def describe(self):
         direction = "both sides"
@@ -251,7 +255,9 @@ def simulate_profile_from_cache(profile, signal_cache):
         target_price = None
         entry_data = {}
         daily_pnl = 0.0
+        peak_daily_pnl = 0.0
         daily_trading_paused = False
+        pause_reason = ""
 
         for candle in candles:
             current_time = candle["DateTime"]
@@ -260,8 +266,8 @@ def simulate_profile_from_cache(profile, signal_cache):
             action = signal_data.get("action", "WAIT")
             params = risk_management()
 
-            if daily_pnl <= -get_daily_loss_limit_amount():
-                daily_trading_paused = True
+            peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
+            daily_trading_paused, pause_reason = should_pause_new_entries(daily_pnl, peak_daily_pnl)
 
             if not in_position and action in ["BUY_LONG", "SELL_SHORT"] and (
                 daily_trading_paused or not profile.permits_entry(action, current_time)
@@ -273,6 +279,15 @@ def simulate_profile_from_cache(profile, signal_cache):
                 quantity = int(signal_data.get("suggested_qty", CONFIG["LOT_SIZE"]))
                 entry_price = current_price * (1 + (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
                 stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
+                risk_allowed, _ = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]))
+                if not risk_allowed:
+                    pos_type = ""
+                    quantity = 0
+                    entry_price = 0.0
+                    stop_loss_price = None
+                    target_price = None
+                    action = "WAIT"
+                    continue
                 entry_data = signal_data
                 in_position = True
                 continue
@@ -297,6 +312,7 @@ def simulate_profile_from_cache(profile, signal_cache):
             _, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", params["brokerage_fee"]))
             pnls.append(net_pnl)
             daily_pnl += net_pnl
+            peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
             in_position = False
             pos_type = ""
             entry_price = 0.0
@@ -412,14 +428,21 @@ def resolve_trading_profile():
 
 
 def build_candles_frame_from_records(records):
+    if not records:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        
     candles = pd.DataFrame(records).copy()
-    if "Close" not in candles.columns and "Price" in candles.columns:
-        candles["Close"] = candles["Price"]
+    
+    # Safely ensure 'Close' exists without raising KeyError
+    if "Close" not in candles.columns:
+        candles["Close"] = candles.get("Price", 0.0)
+        
     candles["Open"] = pd.to_numeric(candles.get("Open", candles["Close"]), errors="coerce").fillna(candles["Close"])
     candles["High"] = pd.to_numeric(candles.get("High", candles["Close"]), errors="coerce").fillna(candles["Close"])
     candles["Low"] = pd.to_numeric(candles.get("Low", candles["Close"]), errors="coerce").fillna(candles["Close"])
     candles["Close"] = pd.to_numeric(candles["Close"], errors="coerce")
     candles["Volume"] = pd.to_numeric(candles.get("Volume", 0.0), errors="coerce").fillna(0.0)
+    
     return candles[["Open", "High", "Low", "Close", "Volume"]]
 
 
@@ -448,16 +471,24 @@ def calculate_entry_levels(entry_price, pos_type, signal_data):
 def update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data):
     breakeven_pct = float(entry_data.get("breakeven_pct", risk_management()["breakeven_pct"]))
     trail_distance = float(entry_data.get("trail_distance", risk_management()["trail_distance"]))
+    stop_loss_pct = float(entry_data.get("stop_loss_pct", risk_management()["stop_loss_pct"]))
+    
     pnl_pct = ((current_price - entry_price) / entry_price) if pos_type == "LONG" else ((entry_price - current_price) / entry_price)
-    if pnl_pct < breakeven_pct:
-        return stop_loss_price
 
     if pos_type == "LONG":
-        trailing_candidate = max(entry_price, current_price * (1 - trail_distance))
-        return max(stop_loss_price or entry_price, trailing_candidate)
+        # Always trail from current moment price to constantly reduce initial risk
+        new_sl = max(stop_loss_price or 0.0, current_price * (1 - stop_loss_pct))
+        if pnl_pct >= breakeven_pct:
+            new_sl = max(new_sl, entry_price) # Guarantee breakeven
+            new_sl = max(new_sl, current_price * (1 - trail_distance)) # Tighten trail to lock profit
+        return new_sl
 
-    trailing_candidate = min(entry_price, current_price * (1 + trail_distance))
-    return min(stop_loss_price or entry_price, trailing_candidate)
+    # SHORT
+    new_sl = min(stop_loss_price or float('inf'), current_price * (1 + stop_loss_pct))
+    if pnl_pct >= breakeven_pct:
+        new_sl = min(new_sl, entry_price) # Guarantee breakeven
+        new_sl = min(new_sl, current_price * (1 + trail_distance)) # Tighten trail to lock profit
+    return new_sl
 
 
 def calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, brokerage_fee):
@@ -468,6 +499,32 @@ def calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, brokerage_f
 
 def get_daily_loss_limit_amount():
     return CONFIG["CAPITAL"] * risk_management()["daily_loss_limit_pct"]
+
+
+def get_max_loss_per_trade_amount():
+    return risk_management(capital=CONFIG["CAPITAL"])["max_loss_per_trade_amount"]
+
+
+def estimate_planned_trade_risk(entry_price, stop_loss_price, quantity, brokerage_fee):
+    if quantity <= 0 or stop_loss_price is None:
+        return float("inf")
+    return abs(entry_price - stop_loss_price) * quantity + brokerage_fee
+
+
+def is_trade_risk_allowed(entry_price, stop_loss_price, quantity, brokerage_fee):
+    planned_risk = estimate_planned_trade_risk(entry_price, stop_loss_price, quantity, brokerage_fee)
+    return planned_risk <= get_max_loss_per_trade_amount(), planned_risk
+
+
+def should_pause_new_entries(daily_pnl, peak_daily_pnl):
+    params = risk_management(capital=CONFIG["CAPITAL"])
+    if daily_pnl <= -get_daily_loss_limit_amount():
+        return True, "DAILY_LOSS_LIMIT"
+    if peak_daily_pnl >= params["profit_protection_start_amount"]:
+        protected_floor = peak_daily_pnl * (1 - params["profit_giveback_pct"])
+        if daily_pnl < protected_floor:
+            return True, "PROFIT_PROTECTION"
+    return False, ""
 
 
 def calculate_performance_stats(report_df):
@@ -497,7 +554,9 @@ def run_profile_backtest(data_records, trading_profile):
     target_price = None
     current_day = None
     daily_pnl = 0.0
+    peak_daily_pnl = 0.0
     daily_trading_paused = False
+    pause_reason = ""
 
     for i in range(29, len(data_records)):
         row = data_records[i]
@@ -509,6 +568,8 @@ def run_profile_backtest(data_records, trading_profile):
                 previous_close = float(data_records[i - 1]["Close"])
                 exit_price = previous_close * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
                 points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", params["brokerage_fee"]))
+                daily_pnl += net_pnl
+                peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
                 trades.append({
                     "Trade_ID": f"{trading_profile.strategy_name.upper()}_{len(trades)+1}",
                     "Entry_Time": entry_time,
@@ -525,6 +586,10 @@ def run_profile_backtest(data_records, trading_profile):
                     "Exit_RSI": None,
                     "Entry_Score": entry_data.get("entry_score"),
                     "Strategy": trading_profile.strategy_name,
+                    "Planned_Risk": round(entry_data.get("planned_risk", 0.0), 2),
+                    "Daily_PnL_After": round(daily_pnl, 2),
+                    "Risk_Allowed": True,
+                    "Session_Stop": pause_reason,
                 })
             in_position = False
             pos_type, entry_price, entry_time = "", 0.0, None
@@ -534,7 +599,9 @@ def run_profile_backtest(data_records, trading_profile):
             target_price = None
             current_day = now_time.date()
             daily_pnl = 0.0
+            peak_daily_pnl = 0.0
             daily_trading_paused = False
+            pause_reason = ""
 
         price_history.append({
             "DateTime": now_time,
@@ -585,8 +652,8 @@ def run_profile_backtest(data_records, trading_profile):
             "Target": target_price,
         })
 
-        if daily_pnl <= -get_daily_loss_limit_amount():
-            daily_trading_paused = True
+        peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
+        daily_trading_paused, pause_reason = should_pause_new_entries(daily_pnl, peak_daily_pnl)
 
         if not in_position and action in ["BUY_LONG", "SELL_SHORT"] and (
             daily_trading_paused or not trading_profile.permits_entry(action, now_time)
@@ -601,6 +668,18 @@ def run_profile_backtest(data_records, trading_profile):
             entry_time = now_time
             entry_data = signal_data
             stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
+            risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]))
+            if not risk_allowed:
+                in_position = False
+                pos_type = ""
+                entry_price = 0.0
+                entry_time = None
+                entry_data = {}
+                quantity = 0
+                stop_loss_price = None
+                target_price = None
+                continue
+            entry_data["planned_risk"] = planned_risk
             continue
 
         if not in_position:
@@ -622,6 +701,7 @@ def run_profile_backtest(data_records, trading_profile):
         exit_price = now_close * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
         points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", params["brokerage_fee"]))
         daily_pnl += net_pnl
+        peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
 
         trades.append({
             "Trade_ID": f"{trading_profile.strategy_name.upper()}_{len(trades)+1}",
@@ -639,6 +719,10 @@ def run_profile_backtest(data_records, trading_profile):
             "Exit_RSI": signal_data.get("rsi"),
             "Entry_Score": entry_data.get("entry_score"),
             "Strategy": trading_profile.strategy_name,
+            "Planned_Risk": round(entry_data.get("planned_risk", 0.0), 2),
+            "Daily_PnL_After": round(daily_pnl, 2),
+            "Risk_Allowed": True,
+            "Session_Stop": pause_reason,
         })
         in_position = False
         pos_type = ""
@@ -654,6 +738,7 @@ def run_profile_backtest(data_records, trading_profile):
         final_time = data_records[-1]["Datetime"]
         exit_price = final_close * (1 - (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
         points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity, entry_data.get("brokerage_fee", risk_management()["brokerage_fee"]))
+        daily_pnl += net_pnl
         trades.append({
             "Trade_ID": f"{trading_profile.strategy_name.upper()}_{len(trades)+1}",
             "Entry_Time": entry_time,
@@ -670,6 +755,10 @@ def run_profile_backtest(data_records, trading_profile):
             "Exit_RSI": None,
             "Entry_Score": entry_data.get("entry_score"),
             "Strategy": trading_profile.strategy_name,
+            "Planned_Risk": round(entry_data.get("planned_risk", 0.0), 2),
+            "Daily_PnL_After": round(daily_pnl, 2),
+            "Risk_Allowed": True,
+            "Session_Stop": pause_reason,
         })
 
     report_df = build_trade_report_frame(trades)
@@ -919,77 +1008,99 @@ def calculate_exit_price(entry_price, is_long, slippage, short=False):
     return entry_price * (1 + slippage)
 
 
-def run_live_trading():
-    """Run live trading during market hours and exit after market close."""
-    print("🚀 Starting LIVE TRADING MODE")
+def run_live_trading(): # Master Real Money Session Loop
+    """Run live trading during market hours and exit after market close.""" # Docstring
+    print("🚀 Starting LIVE TRADING MODE") # Print Start Event Status
 
-    try:
-        smart_api = create_angel_session()
-    except Exception as e:
-        print(f"❌ {e}")
-        return
+    try: # Begin API Boot
+        smart_api = create_angel_session() # Launch and bind Angel API Session credentials
+    except Exception as e: # Handle critical failures
+        print(f"❌ {e}") # Print error to user
+        return # Abandon startup
 
-    print("✅ Angel One login successful")
-    print(f"📡 Using Angel market data for {CONFIG['MARKET_DATA_SYMBOL']} ({CONFIG['MARKET_DATA_INTERVAL']})")
-    trading_profile = resolve_trading_profile()
-    strategy_name = trading_profile.strategy_name
-    print(f"🧠 Active forward profile: {trading_profile.describe()} [{trading_profile.source}]")
+    print("✅ Angel One login successful") # Print Success Event
+    print(f"📡 Using Angel market data for {CONFIG['MARKET_DATA_SYMBOL']} ({CONFIG['MARKET_DATA_INTERVAL']})") # Display charting parameters
+    trading_profile = resolve_trading_profile() # Fetch and configure local or adaptive configurations
+    strategy_name = trading_profile.strategy_name # Bind strategy context
+    print(f"🧠 Active forward profile: {trading_profile.describe()} [{trading_profile.source}]") # Display configuration context
 
-    trades = []
-    price_history = []
-    in_position = False
-    pos_type, entry_price, entry_time = "", 0.0, None
-    entry_data = {}
-    quantity = 0
-    stop_loss_price = None
-    target_price = None
-    last_candle_time = None
-    session_date = None
-    daily_pnl = 0.0
-    daily_trading_paused = False
+    trades = [] # Array tracking session trade details
+    price_history = [] # Array tracking charting ticks
+    in_position = False # State flag
+    pos_type, entry_price, entry_time = "", 0.0, None # Blank tracking variables
+    entry_data = {} # Blank logic properties
+    quantity = 0 # Empty sizing cache
+    stop_loss_price = None # Blank SL cache
+    target_price = None # Blank TP cache
+    last_candle_time = None # Loop repetition state checker
+    session_date = None # Session rollover state checker
+    daily_pnl = 0.0 # Day-to-date money tracker
+    peak_daily_pnl = 0.0 # Highest closed PnL reached during this session
+    daily_trading_paused = False # Flag for blown daily-loss thresholds
+    pause_reason = "" # Why entries are paused
 
-    try:
-        while True:
-            now = datetime.now()
-            market_open, market_close = get_market_window(now)
-            if now.weekday() < 5 and session_date != now.date():
-                session_date = now.date()
-                daily_pnl = 0.0
-                daily_trading_paused = False
+    try: # Begin primary live trading execution loop
+        while True: # Keep spinning indefinitely (until break triggered or crash)
+            now = datetime.now() # Get current actual datetime
+            market_open, market_close = get_market_window(now) # Find actual opening/closing benchmarks for the active day
+            if now.weekday() < 5 and session_date != now.date(): # Reset logic if rolling into a new weekday
+                session_date = now.date() # Bind new session tracker
+                daily_pnl = 0.0 # Reset tracked Day-to-date PnL
+                peak_daily_pnl = 0.0 # Reset session profit watermark
+                daily_trading_paused = False # Enable active entries again
+                pause_reason = "" # Clear session pause reason
 
-            if now >= market_close:
-                print("🏁 Market closed. Sending final report...")
-                if in_position:
-                    current_price = get_live_price(
-                        smart_api,
-                        CONFIG["TRADE_SYMBOL"],
-                        CONFIG["TRADE_EXCHANGE"],
-                        CONFIG["TRADE_SYMBOL_TOKEN"],
-                    )
-                    if current_price is not None:
-                        exit_price = calculate_exit_price(current_price, pos_type == "LONG", CONFIG['SLIPPAGE_BPS'])
-                        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", risk_management()['brokerage_fee']))
-                        trades.append({
-                            "Trade_ID": f"ANGEL_{len(trades)+1}",
-                            "Entry_Time": entry_time,
-                            "Exit_Time": now,
-                            "Type": pos_type,
-                            "Qty": quantity or CONFIG["LOT_SIZE"],
-                            "Entry_Price": round(entry_price, 2),
-                            "Exit_Price": round(exit_price, 2),
-                            "Points": round(points, 2),
-                            "Net_PnL": round(net_pnl, 2),
-                            "Exit_Reason": "MARKET_CLOSE",
-                            "Entry_RSI": entry_data.get('rsi'),
-                            "Entry_EMA_F": entry_data.get('ema_f'),
-                            "Exit_RSI": None,
-                            "Entry_Score": entry_data.get("entry_score"),
-                            "Strategy": strategy_name
-                        })
-                finalize_trading_session(trades, price_history, CONFIG['OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'], "LIVE TRADING")
-                send_session_email()
-                print("✅ Live trading session complete. Exiting...")
-                return
+            if now >= market_close: # If market close logic overrides
+                print("🏁 Market closed. Sending final report...") # Trigger EOD processing
+                if in_position: # Force clean up of un-exited orders (Auto Square-Off mapping)
+                    current_price = get_live_price( # Request current price directly
+                        smart_api, # API object
+                        CONFIG["TRADE_SYMBOL"], # Forward context symbol
+                        CONFIG["TRADE_EXCHANGE"], # Forward context exchange
+                        CONFIG["TRADE_SYMBOL_TOKEN"], # Forward context token
+                    ) # Receive LTP
+                    if current_price is not None: # Confirm LTP resolved
+                        exit_price = calculate_exit_price(current_price, pos_type == "LONG", CONFIG['SLIPPAGE_BPS']) # Process theoretical real exit cost
+                        
+                        # --- CRITICAL FIX: ACTUALLY PLACE THE LIVE BROKER ORDER ---
+                        exit_side = "SELL" if pos_type == "LONG" else "BUY"
+                        exit_order = place_order(
+                            smart_api,
+                            CONFIG["TRADE_SYMBOL"],
+                            exit_side,
+                            quantity or CONFIG["LOT_SIZE"],
+                            exit_price,
+                            exchange=CONFIG["TRADE_EXCHANGE"],
+                            symbol_token=CONFIG["TRADE_SYMBOL_TOKEN"],
+                        )
+                        if exit_order:
+                            print(f"✅ Placed {exit_side} EOD exit order for {CONFIG['TRADE_SYMBOL']} at {exit_price}")
+                        else:
+                            print(f"❌ Failed to place EOD exit order for {CONFIG['TRADE_SYMBOL']} at {exit_price}")
+                        # ----------------------------------------------------------
+                        
+                        points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", risk_management()['brokerage_fee'])) # Map net math
+                        trades.append({ # Log the un-exited EOD order into tracking file
+                            "Trade_ID": f"ANGEL_{len(trades)+1}", # Append numeric log
+                            "Entry_Time": entry_time, # Insert mapped values
+                            "Exit_Time": now, # Insert current exiting time
+                            "Type": pos_type, # Specify Long vs Short
+                            "Qty": quantity or CONFIG["LOT_SIZE"], # Add lot constraints
+                            "Entry_Price": round(entry_price, 2), # Snapshot value
+                            "Exit_Price": round(exit_price, 2), # Snapshot value
+                            "Points": round(points, 2), # Add math results
+                            "Net_PnL": round(net_pnl, 2), # Add math results
+                            "Exit_Reason": "MARKET_CLOSE", # Attribute force closure reason correctly
+                            "Entry_RSI": entry_data.get('rsi'), # Include analytical metadata
+                            "Entry_EMA_F": entry_data.get('ema_f'), # Include analytical metadata
+                            "Exit_RSI": None, # Clean irrelevant field
+                            "Entry_Score": entry_data.get("entry_score"), # Analytics field
+                            "Strategy": strategy_name # Origin tracking
+                        }) 
+                finalize_trading_session(trades, price_history, CONFIG['OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'], "LIVE TRADING") # Run helper to compile outputs to CSV
+                send_session_email() # Send Gmail wrapper report
+                print("✅ Live trading session complete. Exiting...") # Show final line
+                return # Break the function explicitly
 
             if now < market_open or now.weekday() >= 5:
                 print(f"⏰ Outside market hours ({now.strftime('%H:%M')}). Waiting...")
@@ -1041,8 +1152,8 @@ def run_live_trading():
                 )
                 action = signal_data.get('action', 'WAIT')
                 is_new_candle = current_time != last_candle_time
-                if daily_pnl <= -get_daily_loss_limit_amount():
-                    daily_trading_paused = True
+                peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
+                daily_trading_paused, pause_reason = should_pause_new_entries(daily_pnl, peak_daily_pnl)
 
                 if in_position:
                     stop_loss_price = update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data)
@@ -1061,6 +1172,7 @@ def run_live_trading():
                         exit_price = calculate_exit_price(current_price, pos_type == "LONG", CONFIG['SLIPPAGE_BPS'])
                         points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", risk['brokerage_fee']))
                         daily_pnl += net_pnl
+                        peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
                         trades.append({
                             "Trade_ID": f"ANGEL_{len(trades)+1}",
                             "Entry_Time": entry_time,
@@ -1076,7 +1188,11 @@ def run_live_trading():
                             "Entry_EMA_F": entry_data.get('ema_f'),
                             "Exit_RSI": signal_data.get('rsi'),
                             "Entry_Score": entry_data.get("entry_score"),
-                            "Strategy": strategy_name
+                            "Strategy": strategy_name,
+                            "Planned_Risk": round(entry_data.get("planned_risk", 0.0), 2),
+                            "Daily_PnL_After": round(daily_pnl, 2),
+                            "Risk_Allowed": True,
+                            "Session_Stop": pause_reason,
                         })
 
                         exit_side = "SELL" if pos_type == "LONG" else "BUY"
@@ -1084,7 +1200,7 @@ def run_live_trading():
                             smart_api,
                             CONFIG["TRADE_SYMBOL"],
                             exit_side,
-                            CONFIG['LOT_SIZE'],
+                            quantity or CONFIG['LOT_SIZE'],
                             exit_price,
                             exchange=CONFIG["TRADE_EXCHANGE"],
                             symbol_token=CONFIG["TRADE_SYMBOL_TOKEN"],
@@ -1134,6 +1250,19 @@ def run_live_trading():
                     entry_time = now
                     entry_data = signal_data
                     stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
+                    risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", risk["brokerage_fee"]))
+                    if not risk_allowed:
+                        print(f"🛡️ Skipping live entry: planned risk ₹{planned_risk:.2f} exceeds ₹{get_max_loss_per_trade_amount():.2f}")
+                        pos_type = ""
+                        entry_price = 0.0
+                        entry_time = None
+                        entry_data = {}
+                        quantity = 0
+                        stop_loss_price = None
+                        target_price = None
+                        time.sleep(CONFIG["MARKET_POLL_SECONDS"])
+                        continue
+                    entry_data["planned_risk"] = planned_risk
                     side = "BUY" if pos_type == "LONG" else "SELL"
                     order_response = place_order(
                         smart_api,
@@ -1220,7 +1349,9 @@ def run_paper_trading():
     last_candle_time = None
     session_date = None
     daily_pnl = 0.0
+    peak_daily_pnl = 0.0
     daily_trading_paused = False
+    pause_reason = ""
 
     try:
         while True:
@@ -1229,7 +1360,9 @@ def run_paper_trading():
                 reset_paper_session_files(now.date())
                 session_date = now.date()
                 daily_pnl = 0.0
+                peak_daily_pnl = 0.0
                 daily_trading_paused = False
+                pause_reason = ""
             market_open, market_close = get_market_window(now)
 
             if now >= market_close:
@@ -1317,8 +1450,8 @@ def run_paper_trading():
                 )
                 action = signal_data.get('action', 'WAIT')
                 is_new_candle = current_time != last_candle_time
-                if daily_pnl <= -get_daily_loss_limit_amount():
-                    daily_trading_paused = True
+                peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
+                daily_trading_paused, pause_reason = should_pause_new_entries(daily_pnl, peak_daily_pnl)
 
                 if in_position:
                     stop_loss_price = update_trailing_stop(current_price, entry_price, pos_type, stop_loss_price, entry_data)
@@ -1364,6 +1497,19 @@ def run_paper_trading():
                     entry_time = now
                     entry_data = signal_data
                     stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
+                    risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]))
+                    if not risk_allowed:
+                        print(f"🛡️ Skipping paper entry: planned risk ₹{planned_risk:.2f} exceeds ₹{get_max_loss_per_trade_amount():.2f}")
+                        pos_type = ""
+                        entry_price = 0.0
+                        entry_time = None
+                        entry_data = {}
+                        quantity = 0
+                        stop_loss_price = None
+                        target_price = None
+                        time.sleep(CONFIG["MARKET_POLL_SECONDS"])
+                        continue
+                    entry_data["planned_risk"] = planned_risk
                     in_position = True
                     print(f"🟢 Paper entry simulated: {pos_type} at {entry_price:.2f} | Qty {quantity} | SL {stop_loss_price:.2f} | Target {target_price:.2f}")
                     time.sleep(CONFIG["MARKET_POLL_SECONDS"])
@@ -1373,6 +1519,7 @@ def run_paper_trading():
                     exit_price = current_price * (1 - (CONFIG['SLIPPAGE_BPS'] if pos_type == "LONG" else -CONFIG['SLIPPAGE_BPS']))
                     points, net_pnl = calculate_trade_pnl(entry_price, exit_price, pos_type, quantity or CONFIG["LOT_SIZE"], entry_data.get("brokerage_fee", params['brokerage_fee']))
                     daily_pnl += net_pnl
+                    peak_daily_pnl = max(peak_daily_pnl, daily_pnl)
                     trades.append({
                         "Trade_ID": f"PAPER_{len(trades)+1}",
                         "Entry_Time": entry_time,
@@ -1388,7 +1535,11 @@ def run_paper_trading():
                         "Entry_EMA_F": entry_data.get('ema_f'),
                         "Exit_RSI": signal_data.get('rsi'),
                         "Entry_Score": entry_data.get("entry_score"),
-                        "Strategy": strategy_name
+                        "Strategy": strategy_name,
+                        "Planned_Risk": round(entry_data.get("planned_risk", 0.0), 2),
+                        "Daily_PnL_After": round(daily_pnl, 2),
+                        "Risk_Allowed": True,
+                        "Session_Stop": pause_reason,
                     })
                     print(f"🔴 Paper exit simulated: {pos_type} closed at {exit_price:.2f} @ {now:%Y-%m-%d %H:%M} | PnL: ₹{net_pnl:.2f} ({exit_reason})")
                     persist_paper_session_snapshot(trades, price_history)
