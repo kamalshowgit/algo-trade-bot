@@ -1319,6 +1319,38 @@ def reset_paper_session_files(session_date):
     print(f"🧹 Reset paper trading files for {session_date.isoformat()}")
 
 
+def load_paper_session_files(session_date):
+    trades = []
+    price_history = []
+
+    if os.path.exists(CONFIG['PAPER_OUTPUT_FILE']):
+        try:
+            trades_df = pd.read_csv(CONFIG['PAPER_OUTPUT_FILE'])
+            if not trades_df.empty and "Entry_Time" in trades_df.columns:
+                entry_dates = pd.to_datetime(trades_df["Entry_Time"], errors="coerce").dt.date
+                trades_df = trades_df.loc[entry_dates == session_date]
+            trades = trades_df.to_dict("records") if not trades_df.empty else []
+        except Exception as exc:
+            print(f"⚠️ Could not reload paper trades: {exc}")
+
+    if os.path.exists(CONFIG['PRICE_HISTORY_FILE']):
+        try:
+            price_df = pd.read_csv(CONFIG['PRICE_HISTORY_FILE'])
+            if not price_df.empty and "DateTime" in price_df.columns:
+                price_dates = pd.to_datetime(price_df["DateTime"], errors="coerce").dt.date
+                price_df = price_df.loc[price_dates == session_date]
+            price_history = price_df.to_dict("records") if not price_df.empty else []
+        except Exception as exc:
+            print(f"⚠️ Could not reload price history: {exc}")
+
+    return trades, price_history
+
+
+def has_paper_session_data(session_date):
+    trades, price_history = load_paper_session_files(session_date)
+    return bool(trades or price_history), trades, price_history
+
+
 def persist_paper_session_snapshot(trades, price_history):
     save_trade_and_price_files(trades, price_history, CONFIG['PAPER_OUTPUT_FILE'], CONFIG['PRICE_HISTORY_FILE'])
 
@@ -1357,10 +1389,20 @@ def run_paper_trading():
         while True:
             now = datetime.now()
             if now.weekday() < 5 and session_date != now.date():
-                reset_paper_session_files(now.date())
                 session_date = now.date()
-                daily_pnl = 0.0
-                peak_daily_pnl = 0.0
+                has_existing_session, restored_trades, restored_price_history = has_paper_session_data(session_date)
+                if has_existing_session:
+                    trades = restored_trades
+                    price_history = restored_price_history
+                    daily_pnl = sum(safe_float(trade.get("Net_PnL", 0.0)) for trade in trades)
+                    peak_daily_pnl = max(daily_pnl, 0.0)
+                    print(f"♻️ Restored paper session for {session_date.isoformat()} | Trades: {len(trades)} | Price rows: {len(price_history)}")
+                else:
+                    reset_paper_session_files(session_date)
+                    trades = []
+                    price_history = []
+                    daily_pnl = 0.0
+                    peak_daily_pnl = 0.0
                 daily_trading_paused = False
                 pause_reason = ""
             market_open, market_close = get_market_window(now)
