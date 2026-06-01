@@ -1115,6 +1115,9 @@ def run_live_trading(): # Master Real Money Session Loop
                 return # Break the function explicitly
 
             if now < market_open or now.weekday() >= 5:
+                if now.weekday() >= 5:
+                    print(f"🛌 Weekend detected ({now:%A}). Live bot exiting until next weekday session.")
+                    return
                 print(f"⏰ Outside market hours ({now.strftime('%H:%M')}). Waiting...")
                 time.sleep(60)
                 continue
@@ -1457,6 +1460,9 @@ def run_paper_trading():
                 return
 
             if now < market_open or now.weekday() >= 5:
+                if now.weekday() >= 5:
+                    print(f"🛌 Weekend detected ({now:%A}). Paper bot exiting until next weekday session.")
+                    return
                 print(f"⏰ Outside market hours ({now.strftime('%H:%M')}). Waiting...")
                 time.sleep(60)
                 continue

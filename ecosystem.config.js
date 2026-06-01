@@ -8,8 +8,8 @@ module.exports = {
     // Starts the bot at 9:15 AM IST (market open), Monday to Friday
     cron_restart: "15 9 * * 1-5",
     
-    // Graceful restart at 3:20 PM IST (after market close)
-    cron_stop: "20 15 * * 1-5",
+    // The Python bot exits cleanly after market close and on weekends.
+    // PM2's cron restart is intentionally weekday-only.
     
     // Prevents infinite restart loops with exponential backoff
     autorestart: true,
