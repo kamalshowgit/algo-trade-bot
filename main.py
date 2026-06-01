@@ -279,7 +279,8 @@ def simulate_profile_from_cache(profile, signal_cache):
                 quantity = int(signal_data.get("suggested_qty", CONFIG["LOT_SIZE"]))
                 entry_price = current_price * (1 + (CONFIG["SLIPPAGE_BPS"] if pos_type == "LONG" else -CONFIG["SLIPPAGE_BPS"]))
                 stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
-                risk_allowed, _ = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]))
+                risk_budget = get_new_entry_risk_budget(daily_pnl, peak_daily_pnl)
+                risk_allowed, _ = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]), risk_budget)
                 if not risk_allowed:
                     pos_type = ""
                     quantity = 0
@@ -511,9 +512,19 @@ def estimate_planned_trade_risk(entry_price, stop_loss_price, quantity, brokerag
     return abs(entry_price - stop_loss_price) * quantity + brokerage_fee
 
 
-def is_trade_risk_allowed(entry_price, stop_loss_price, quantity, brokerage_fee):
+def get_new_entry_risk_budget(daily_pnl=0.0, peak_daily_pnl=0.0):
+    base_budget = get_max_loss_per_trade_amount()
+    params = risk_management(capital=CONFIG["CAPITAL"])
+    if peak_daily_pnl >= params["profit_protection_start_amount"]:
+        protected_floor = peak_daily_pnl * (1 - params["profit_giveback_pct"])
+        return max(0.0, min(base_budget, daily_pnl - protected_floor))
+    return base_budget
+
+
+def is_trade_risk_allowed(entry_price, stop_loss_price, quantity, brokerage_fee, risk_budget=None):
     planned_risk = estimate_planned_trade_risk(entry_price, stop_loss_price, quantity, brokerage_fee)
-    return planned_risk <= get_max_loss_per_trade_amount(), planned_risk
+    max_allowed_risk = get_max_loss_per_trade_amount() if risk_budget is None else min(get_max_loss_per_trade_amount(), risk_budget)
+    return planned_risk <= max_allowed_risk, planned_risk
 
 
 def should_pause_new_entries(daily_pnl, peak_daily_pnl):
@@ -668,7 +679,8 @@ def run_profile_backtest(data_records, trading_profile):
             entry_time = now_time
             entry_data = signal_data
             stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
-            risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]))
+            risk_budget = get_new_entry_risk_budget(daily_pnl, peak_daily_pnl)
+            risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]), risk_budget)
             if not risk_allowed:
                 in_position = False
                 pos_type = ""
@@ -1250,9 +1262,10 @@ def run_live_trading(): # Master Real Money Session Loop
                     entry_time = now
                     entry_data = signal_data
                     stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
-                    risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", risk["brokerage_fee"]))
+                    risk_budget = get_new_entry_risk_budget(daily_pnl, peak_daily_pnl)
+                    risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", risk["brokerage_fee"]), risk_budget)
                     if not risk_allowed:
-                        print(f"🛡️ Skipping live entry: planned risk ₹{planned_risk:.2f} exceeds ₹{get_max_loss_per_trade_amount():.2f}")
+                        print(f"🛡️ Skipping live entry: planned risk ₹{planned_risk:.2f} exceeds allowed risk ₹{risk_budget:.2f}")
                         pos_type = ""
                         entry_price = 0.0
                         entry_time = None
@@ -1539,9 +1552,10 @@ def run_paper_trading():
                     entry_time = now
                     entry_data = signal_data
                     stop_loss_price, target_price = calculate_entry_levels(entry_price, pos_type, signal_data)
-                    risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]))
+                    risk_budget = get_new_entry_risk_budget(daily_pnl, peak_daily_pnl)
+                    risk_allowed, planned_risk = is_trade_risk_allowed(entry_price, stop_loss_price, quantity, signal_data.get("brokerage_fee", params["brokerage_fee"]), risk_budget)
                     if not risk_allowed:
-                        print(f"🛡️ Skipping paper entry: planned risk ₹{planned_risk:.2f} exceeds ₹{get_max_loss_per_trade_amount():.2f}")
+                        print(f"🛡️ Skipping paper entry: planned risk ₹{planned_risk:.2f} exceeds allowed risk ₹{risk_budget:.2f}")
                         pos_type = ""
                         entry_price = 0.0
                         entry_time = None

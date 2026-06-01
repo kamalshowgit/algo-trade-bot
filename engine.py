@@ -3,7 +3,7 @@ import pandas as pd # Import pandas for data manipulation and DataFrame structur
 
 STRATEGIES = ["strategy_1", "strategy_2", "strategy_3", "strategy_4"] # Define the available trading strategies
 MIN_SIGNAL_CANDLES = 21 # 20-candle breakout window plus current candle
-LATEST_ENTRY_MINUTE = 14 * 60 + 30 # Allow continuation entries until 2:30 PM
+LATEST_ENTRY_MINUTE = 15 * 60 + 15 # Match the default profile entry window; profile rules remain the main gate
 
 # ==============================
 # SAFE DATA BUILDER (CORE FIX)
@@ -135,8 +135,9 @@ def get_market_regime(df): # Function to determine the current market trend/regi
 def risk_management(current=None, capital=100000, lot_size=50): # Determine risk limits per trade
 
     atr_pct = 0.002 # Default Average True Range percentage (0.2%)
-    
-    max_loss_per_trade_amount = 5000.0 # Hard cap sized for one NIFTY lot with a 0.30% stop
+    brokerage_fee = 60.0 # Flat assumed brokerage fee per completed trade
+    slippage_bps = 0.0003 # Match execution slippage used by the live/paper loops
+    max_loss_per_trade_amount = capital * 0.03 # Hard cap: never plan more than 3% risk
 
     if current is not None: # If current candle data is provided
         try: # Safely attempt to extract recent ATR percentage
@@ -146,9 +147,19 @@ def risk_management(current=None, capital=100000, lot_size=50): # Determine risk
         except: # Ignore extraction errors
             pass # Fallback to default ATR
 
-    # DYNAMIC VOLATILITY-ADJUSTED RISK
-    # Minimum stop of 0.30%, but expands if market is highly volatile (2.5x recent ATR)
-    stop_loss_pct = max(0.0030, atr_pct * 2.5) 
+    # Dynamic volatility stop, capped so one configured lot stays inside the 3% risk budget.
+    base_stop_loss_pct = max(0.0030, atr_pct * 2.5)
+    stop_loss_pct = base_stop_loss_pct
+    if current is not None:
+        try:
+            price = float(current.get("price", 0.0))
+        except Exception:
+            price = 0.0
+        usable_risk_amount = max(0.0, max_loss_per_trade_amount - brokerage_fee)
+        if price > 0 and lot_size > 0 and usable_risk_amount > 0:
+            max_stop_for_one_lot = (usable_risk_amount / (price * lot_size)) - (slippage_bps * 2)
+            if max_stop_for_one_lot > 0:
+                stop_loss_pct = min(base_stop_loss_pct, max_stop_for_one_lot)
     
     # Target is dynamically set to 2.0x the actual risk (1:2 Risk/Reward) for higher profitability
     target_pct = stop_loss_pct * 2.0 
@@ -164,14 +175,15 @@ def risk_management(current=None, capital=100000, lot_size=50): # Determine risk
         "target_pct": target_pct, # Output calculated Target pct
         "breakeven_pct": breakeven_pct, # Output breakeven trigger pct
         "trail_distance": trail_distance, # Output trailing distance pct
-        "brokerage_fee": 60, # Flat assumed brokerage fee per trade
-        "risk_per_trade_pct": 0.015, # Risk max 1.5% per trade
+        "brokerage_fee": brokerage_fee, # Flat assumed brokerage fee per trade
+        "risk_per_trade_pct": 0.03, # Risk max 3% per trade
         "max_loss_per_trade_amount": max_loss_per_trade_amount, # Absolute per-trade risk ceiling in rupees
         "daily_loss_limit_pct": 3000.0 / capital, # STRICT max daily loss limit is exact 3000.0 rupees
         "profit_protection_start_amount": 1000.0, # Protect session gains earlier (at 1000 profit)
         "profit_giveback_pct": 0.20, # Conserve 80% of peak daily profit, stop entries if 20% given back
         "lot_size": lot_size, # Instrument lot size
         "capital": capital, # Total working capital
+        "slippage_bps": slippage_bps, # Execution slippage assumption
     }
 
 
@@ -203,8 +215,8 @@ def calculate_position_size(
     # Calculate valid F&O lot multipliers
     lots = risk_qty // lot_size
     
-    if lots < 1: # If risk is too tight for even 1 lot, default to 1 lot so trades can still fire
-        lots = 1
+    if lots < 1: # If risk is too tight for even 1 lot, skip instead of exceeding the cap
+        return 0
         
     return lots * lot_size # Return the total raw quantity of shares/contracts scaled to lot size
 
@@ -414,6 +426,7 @@ def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwa
         "breakeven_pct": risk["breakeven_pct"], # Assigned Breakeven parameter
         "trail_distance": risk["trail_distance"], # Assigned Trailing parameter
         "suggested_qty": qty, # Total Quantity Size
+        "brokerage_fee": risk["brokerage_fee"], # Brokerage used for risk checks and PnL
         "max_loss_per_trade_amount": risk["max_loss_per_trade_amount"], # Hard per-trade loss cap
         "daily_loss_limit_pct": risk["daily_loss_limit_pct"], # Session/day circuit breaker
         "profit_protection_start_amount": risk["profit_protection_start_amount"], # Profit protection threshold
