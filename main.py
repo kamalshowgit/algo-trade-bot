@@ -6,7 +6,7 @@ import time # Import time for sleeping/pausing execution
 import glob # Import glob to search for files matching a specific pattern
 from dataclasses import dataclass # Import dataclass for structured objects (fixed syntax typo datac3lass -> dataclass)
 from datetime import datetime, timedelta, time as dt_time # Import datetime tools for timestamp management
-from engine import STRATEGIES, calculate_signals, risk_management # Import core trading logic from engine.py
+from engine import STRATEGIES, MIN_SIGNAL_CANDLES, calculate_signals, risk_management # Import core trading logic from engine.py
 from dotenv import load_dotenv # Import load_dotenv to read secrets from a .env file
 
 load_dotenv() # Execute load_dotenv to load environment variables into the os.environ dictionary
@@ -218,7 +218,7 @@ def precompute_strategy_signals(records_by_day, strategy_names):
         day_cache = []
         for day_records in records_by_day:
             candle_cache = []
-            for index in range(29, len(day_records)):
+            for index in range(MIN_SIGNAL_CANDLES - 1, len(day_records)):
                 record = day_records[index]
                 recent_candles = build_candles_frame_from_records(day_records[max(0, index - 59):index + 1])
                 price_window = recent_candles["Close"].tolist()
@@ -558,7 +558,7 @@ def run_profile_backtest(data_records, trading_profile):
     daily_trading_paused = False
     pause_reason = ""
 
-    for i in range(29, len(data_records)):
+    for i in range(MIN_SIGNAL_CANDLES - 1, len(data_records)):
         row = data_records[i]
         now_time, now_close = row["Datetime"], float(row["Close"])
         params = risk_management()
@@ -1116,7 +1116,7 @@ def run_live_trading(): # Master Real Money Session Loop
                     now - timedelta(days=CONFIG["CANDLE_LOOKBACK_DAYS"]),
                     now,
                 )
-                if df.empty or len(df) < 26:
+                if df.empty or len(df) < MIN_SIGNAL_CANDLES:
                     print("⏳ Waiting for enough Angel candle history...")
                     time.sleep(CONFIG["MARKET_POLL_SECONDS"])
                     continue
@@ -1457,7 +1457,7 @@ def run_paper_trading():
                     now - timedelta(days=CONFIG["CANDLE_LOOKBACK_DAYS"]),
                     now,
                 )
-                if df.empty or len(df) < 26:
+                if df.empty or len(df) < MIN_SIGNAL_CANDLES:
                     print("⏳ Waiting for enough Angel candle history...")
                     time.sleep(CONFIG["MARKET_POLL_SECONDS"])
                     continue
@@ -1617,8 +1617,8 @@ def run_angel_backtest():
         return
 
     df = df.dropna()
-    if len(df) < 30:
-        print(f"❌ Insufficient data: {len(df)} < 30 required")
+    if len(df) < MIN_SIGNAL_CANDLES:
+        print(f"❌ Insufficient data: {len(df)} < {MIN_SIGNAL_CANDLES} required")
         return
 
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)

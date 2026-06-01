@@ -2,6 +2,8 @@ import numpy as np # Import numpy for fast numerical operations and NaN handling
 import pandas as pd # Import pandas for data manipulation and DataFrame structures
 
 STRATEGIES = ["strategy_1", "strategy_2", "strategy_3", "strategy_4"] # Define the available trading strategies
+MIN_SIGNAL_CANDLES = 21 # 20-candle breakout window plus current candle
+LATEST_ENTRY_MINUTE = 14 * 60 + 30 # Allow continuation entries until 2:30 PM
 
 # ==============================
 # SAFE DATA BUILDER (CORE FIX)
@@ -134,7 +136,7 @@ def risk_management(current=None, capital=100000, lot_size=50): # Determine risk
 
     atr_pct = 0.002 # Default Average True Range percentage (0.2%)
     
-    max_loss_per_trade_amount = 1500.0 # STRICT HARD CAP: Never risk more than ₹1500 per trade (1.5% of 100k)
+    max_loss_per_trade_amount = 5000.0 # Hard cap sized for one NIFTY lot with a 0.30% stop
 
     if current is not None: # If current candle data is provided
         try: # Safely attempt to extract recent ATR percentage
@@ -346,12 +348,12 @@ def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwa
     lot_size = kwargs.get("lot_size", 50) # Fetch configured lot size
     strategy_name = kwargs.get("strategy_name", "strategy_1") # Fetch active strategy selector
 
-    if candles_df is None and (price_list is None or len(price_list) < 30): # Sanity check for minimum data
+    if candles_df is None and (price_list is None or len(price_list) < MIN_SIGNAL_CANDLES): # Sanity check for minimum data
         return {"action": "WAIT"} # Wait for more data
 
     df = get_base_df(price_list=price_list, candles_df=candles_df) # Process technical indicators
 
-    if len(df) < 30: # Confirm again we have enough history post-processing
+    if len(df) < MIN_SIGNAL_CANDLES: # Confirm again we have enough history post-processing
         return {"action": "WAIT"} # Wait for more data
 
     current = df.iloc[-1] # Get the current (most recent) candle data
@@ -377,7 +379,7 @@ def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwa
         is_too_late = False
         if hasattr(current_time, "hour"):
             market_minute = current_time.hour * 60 + current_time.minute
-            if market_minute >= 14 * 60 + 00: # 14:00 (2:00 PM) - Stop entries earlier to avoid afternoon chop
+            if market_minute >= LATEST_ENTRY_MINUTE: # Stop late entries while still allowing trend continuation trades
                 is_too_late = True
                 
         if not is_too_late:
