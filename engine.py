@@ -4,6 +4,8 @@ import pandas as pd # Import pandas for data manipulation and DataFrame structur
 STRATEGIES = ["strategy_1", "strategy_2", "strategy_3", "strategy_4"] # Define the available trading strategies
 MIN_SIGNAL_CANDLES = 21 # 20-candle breakout window plus current candle
 LATEST_ENTRY_MINUTE = 15 * 60 + 15 # Match the default profile entry window; profile rules remain the main gate
+# Safety thresholds to avoid high-risk entries
+SHORT_MIN_RSI = 35.0  # Do not open new SHORTs when RSI is below this (avoids shorting deeply oversold bounces)
 
 # ==============================
 # SAFE DATA BUILDER (CORE FIX)
@@ -395,7 +397,16 @@ def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwa
                 is_too_late = True
                 
         if not is_too_late:
-            action = select_entry_signal(current, regime, strategy_name) # Evaluate configured entry setup
+                action = select_entry_signal(current, regime, strategy_name) # Evaluate configured entry setup
+
+                # Global safety gate: avoid opening SHORTs when RSI is very low (deeply oversold)
+                try:
+                    current_rsi = float(current.get("rsi", 50.0))
+                except Exception:
+                    current_rsi = 50.0
+
+                if action == "SELL_SHORT" and current_rsi < SHORT_MIN_RSI:
+                    action = "WAIT"
 
     # ================= EXIT =================
     elif position > 0: # If we are in a LONG trade
