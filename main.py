@@ -8,6 +8,7 @@ from dataclasses import dataclass # Import dataclass for structured objects (fix
 from datetime import datetime, timedelta, time as dt_time # Import datetime tools for timestamp management
 from engine import STRATEGIES, MIN_SIGNAL_CANDLES, calculate_signals, risk_management # Import core trading logic from engine.py
 from dotenv import load_dotenv # Import load_dotenv to read secrets from a .env file
+import threading # Import threading for continuous WebSocket processing
 
 load_dotenv() # Execute load_dotenv to load environment variables into the os.environ dictionary
 
@@ -24,6 +25,12 @@ def get_int_env(name, default, minimum=None): # Utility function to fetch int EN
 def get_bool_env(name, default): # Utility function to fetch boolean ENV variables safely
     return os.getenv(name, str(default)).strip().lower() == "true" # Returns exact True if environment string matches "true", else False
 
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 CONFIG = { # Master configuration dictionary loading global execution parameters
     "SYMBOL": "^NSEI", # The default backtesting index symbol
@@ -829,6 +836,30 @@ def close_angel_session(smart_api):
         pass
 
 
+# ==============================
+# WEBSOCKET STREAMING ENGINE
+# ==============================
+LTP_CACHE = {} 
+
+def start_websocket_feed(smart_api, token_list):
+    """Initializes the background WebSocket stream for fail-safe high-frequency pricing."""
+    try:
+        from SmartApi.webSocket.SmartWebSocketV2 import SmartWebSocketV2
+        feed_token = smart_api.getfeedToken()
+        sws = SmartWebSocketV2(feed_token, CLIENT_ID)
+        
+        def on_data(ws, message):
+            if isinstance(message, dict) and "tk" in message and "ltp" in message:
+                LTP_CACHE[str(message["tk"])] = float(message["ltp"])
+                
+        sws.on_data = on_data
+        t = threading.Thread(target=sws.connect, daemon=True)
+        t.start()
+        return sws
+    except Exception as e:
+        print(f"⚠️ WebSocket unavailable, reverting to REST polling: {e}")
+        return None
+
 def get_market_window(now=None):
     now = now or datetime.now()
     market_open = datetime.combine(now.date(), dt_time(9, 15))
@@ -909,6 +940,12 @@ def fetch_angel_candles(smart_api, exchange, symbol_token, interval, from_dt, to
 
 def get_live_price(smart_api, symbol, exchange, symbol_token):
     """Fetch LTP from Angel One without falling back to delayed third-party data."""
+    # 1. Evaluate ultra-fast WebSocket sub-second memory cache
+    token_str = str(symbol_token)
+    if token_str in LTP_CACHE:
+        return LTP_CACHE[token_str]
+        
+    # 2. Fallback to REST API
     if hasattr(smart_api, "ltpData"):
         try:
             quote = smart_api.ltpData(exchange, symbol, str(symbol_token))
@@ -1001,10 +1038,9 @@ def place_order(smart_api, symbol, side, quantity, price, exchange="NSE", symbol
             "symboltoken": str(symbol_token),
             "transactiontype": side,
             "exchange": exchange,
-            "ordertype": "LIMIT",
+            "ordertype": "MARKET",
             "producttype": "INTRADAY",
             "duration": "DAY",
-            "price": str(price),
             "quantity": str(quantity)
         }
         response = smart_api.placeOrder(order_params)
@@ -1035,6 +1071,9 @@ def run_live_trading(): # Master Real Money Session Loop
     trading_profile = resolve_trading_profile() # Fetch and configure local or adaptive configurations
     strategy_name = trading_profile.strategy_name # Bind strategy context
     print(f"🧠 Active forward profile: {trading_profile.describe()} [{trading_profile.source}]") # Display configuration context
+    
+    # Bind and execute market fail-safe ticks
+    sws = start_websocket_feed(smart_api, [CONFIG["TRADE_SYMBOL_TOKEN"], CONFIG["MARKET_DATA_SYMBOL_TOKEN"]])
 
     trades = [] # Array tracking session trade details
     price_history = [] # Array tracking charting ticks

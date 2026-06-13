@@ -2,156 +2,171 @@ import numpy as np # Import numpy for fast numerical operations and NaN handling
 import pandas as pd # Import pandas for data manipulation and DataFrame structures
 
 STRATEGIES = ["strategy_1", "strategy_2", "strategy_3", "strategy_4"] # Define the available trading strategies
-MIN_SIGNAL_CANDLES = 21 # 20-candle breakout window plus current candle
-LATEST_ENTRY_MINUTE = 15 * 60 + 15 # Match the default profile entry window; profile rules remain the main gate
+MIN_SIGNAL_CANDLES = 50 # Increased for ADX and slow EMA stabilization
+LATEST_ENTRY_MINUTE = 15 * 60 + 00 # Stop taking new entries at 3:00 PM
 # Safety thresholds to avoid high-risk entries
-SHORT_MIN_RSI = 35.0  # Do not open new SHORTs when RSI is below this (avoids shorting deeply oversold bounces)
+SHORT_MIN_RSI = 30.0  # Do not open new SHORTs when RSI is below this (avoids shorting deeply oversold bounces)
 
 # ==============================
-# SAFE DATA BUILDER (CORE FIX)
+# SAFE DATA BUILDER
 # ==============================
-def _build_market_df(price_list=None, candles_df=None): # Function to safely build a standardized market dataframe
+def _build_market_df(price_list=None, candles_df=None):
 
-    if candles_df is not None: # Check if a dataframe of candles was passed
-        df = candles_df.copy() # Make a copy to avoid mutating the original dataframe
-    else: # If no dataframe was passed
-        df = pd.DataFrame({"Close": price_list}) # Construct one using the provided price list
+    if candles_df is not None: 
+        df = candles_df.copy() 
+    else: 
+        df = pd.DataFrame({"Close": price_list}) 
 
-    # Normalize OHLCV column names without mutating other arbitrary columns
-    rename_map = {c: c.capitalize() for c in df.columns if c.lower() in ["open", "high", "low", "close", "volume"]} # Map lowercase names to Capitalized
-    df = df.rename(columns=rename_map) # Apply the renaming map to the dataframe columns
+    rename_map = {c: c.capitalize() for c in df.columns if c.lower() in ["open", "high", "low", "close", "volume"]}
+    df = df.rename(columns=rename_map)
 
-    if "Close" not in df.columns: # Check if the 'Close' column exists
-        raise ValueError("Close column required") # Raise an error if 'Close' is missing, as it's mandatory
+    if "Close" not in df.columns: 
+        raise ValueError("Close column required")
 
-    # Ensure ALL columns exist (Angel + backtest compatible)
-    for col in ["Open", "High", "Low", "Close", "Volume"]: # Loop through essential OHLCV columns
-        if col not in df.columns: # If a required column is missing
-            if col == "Volume": # If the missing column is Volume
-                df[col] = 0.0 # Initialize it with 0.0 (no volume)
-            else: # For missing Open, High, or Low
-                df[col] = df["Close"] # Fallback to the Close price
+    for col in ["Open", "High", "Low", "Close", "Volume"]: 
+        if col not in df.columns: 
+            if col == "Volume": 
+                df[col] = 0.0 
+            else: 
+                df[col] = df["Close"] 
 
-    # Convert safely
-    for col in ["Open", "High", "Low", "Close", "Volume"]: # Loop through columns again
-        df[col] = pd.to_numeric(df[col], errors="coerce") # Coerce invalid parsing into NaN
+    for col in ["Open", "High", "Low", "Close", "Volume"]: 
+        df[col] = pd.to_numeric(df[col], errors="coerce") 
 
-    df = df.ffill().bfill() # Forward fill then backward fill any NaN values to ensure data continuity
+    df = df.ffill().bfill() 
 
-    df["price"] = df["Close"] # Duplicate the 'Close' column as a generic 'price' column for easier access
+    df["price"] = df["Close"] 
 
-    return df.reset_index(drop=True) # Reset the dataframe index and drop the old one before returning
+    return df.reset_index(drop=True)
 
 
 # ==============================
 # FEATURE ENGINEERING
 # ==============================
-def get_base_df(price_list=None, candles_df=None): # Function to extract technical features
+def get_base_df(price_list=None, candles_df=None): 
 
-    df = _build_market_df(price_list, candles_df) # Build and standardize the dataframe
+    df = _build_market_df(price_list, candles_df)
 
     # EMA TREND
-    df["ema_fast"] = df["price"].ewm(span=9, adjust=False).mean() # Calculate the 9-period Exponential Moving Average
-    df["ema_mid"] = df["price"].ewm(span=21, adjust=False).mean() # Calculate the 21-period Exponential Moving Average
-    df["ema_slow"] = df["price"].ewm(span=50, adjust=False).mean() # Calculate the 50-period Exponential Moving Average
+    df["ema_fast"] = df["price"].ewm(span=9, adjust=False).mean()
+    df["ema_mid"] = df["price"].ewm(span=21, adjust=False).mean()
+    df["ema_slow"] = df["price"].ewm(span=50, adjust=False).mean()
 
     # VWAP (SAFE for zero volume)
     vol = df["Volume"].replace(0, np.nan)
-    if vol.isna().all(): # Fallback to SMA if volume is missing entirely (e.g. Yahoo Finance indices)
+    if vol.isna().all(): 
         df["vwap"] = df["price"].rolling(window=60, min_periods=1).mean()
     else:
         df["vwap"] = (df["price"] * vol).rolling(window=60, min_periods=1).sum() / vol.rolling(window=60, min_periods=1).sum()
-        df["vwap"] = df["vwap"].fillna(df["price"].rolling(window=60, min_periods=1).mean()) # Fill NaN VWAP values with SMA as fallback
+        df["vwap"] = df["vwap"].fillna(df["price"].rolling(window=60, min_periods=1).mean())
 
     # Bollinger Bands
-    df["sma_20"] = df["price"].rolling(20).mean() # Calculate the 20-period Simple Moving Average
-    df["std_20"] = df["price"].rolling(20).std() # Calculate the 20-period standard deviation
-    df["upper_band"] = df["sma_20"] + 2 * df["std_20"] # Upper Bollinger Band (SMA + 2 * StdDev)
-    df["lower_band"] = df["sma_20"] - 2 * df["std_20"] # Lower Bollinger Band (SMA - 2 * StdDev)
-    df["bb_width"] = (df["upper_band"] - df["lower_band"]) / df["sma_20"].replace(0, np.nan) # Prevent division by zero
+    df["sma_20"] = df["price"].rolling(20).mean()
+    df["std_20"] = df["price"].rolling(20).std()
+    df["upper_band"] = df["sma_20"] + 2 * df["std_20"]
+    df["lower_band"] = df["sma_20"] - 2 * df["std_20"]
+    df["bb_width"] = (df["upper_band"] - df["lower_band"]) / df["sma_20"].replace(0, np.nan)
 
     # RSI
-    delta = df["price"].diff() # Find the difference in price between consecutive periods
-    gain = delta.clip(lower=0).rolling(14).mean() # Isolate gains and calculate the 14-period rolling mean
-    loss = (-delta.clip(upper=0)).rolling(14).mean() # Isolate losses and calculate the 14-period rolling mean
-    rs = gain / (loss + 1e-9) # Compute Relative Strength (RS), adding epsilon (1e-9) to avoid division by zero
-    df["rsi"] = 100 - (100 / (1 + rs)) # Convert RS to the Relative Strength Index (RSI) oscillator
+    delta = df["price"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / (loss + 1e-9)
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    # MACD (Moving Average Convergence Divergence) - For Ultimate Trend Confirmation
+    # MACD
     df["macd"] = df["price"].ewm(span=12, adjust=False).mean() - df["price"].ewm(span=26, adjust=False).mean()
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
     df["macd_hist"] = df["macd"] - df["macd_signal"]
     df["macd_hist_slope"] = df["macd_hist"] - df["macd_hist"].shift(1)
 
-    # ATR
-    prev_close = df["price"].shift(1) # Get the previous period's closing price
-    tr = pd.concat([ # Compute True Range as the maximum of three possible measures:
-        df["High"] - df["Low"], # 1. Current High minus current Low
-        (df["High"] - prev_close).abs(), # 2. Absolute value of current High minus previous Close
-        (df["Low"] - prev_close).abs() # 3. Absolute value of current Low minus previous Close
-    ], axis=1).max(axis=1) # Find the maximum of the three columns per row
+    # ATR & ADX (For Market Regime Detection)
+    prev_close = df["price"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
 
-    df["atr"] = tr.rolling(14).mean() # Calculate the Average True Range (14-period rolling mean of True Range)
-    df["atr_pct"] = df["atr"] / df["price"] # Convert ATR into a percentage of the current price for normalized volatility
-    df["recent_high"] = df["High"].rolling(20).max().shift(1) # Previous 20-candle high for breakout checks
-    df["recent_low"] = df["Low"].rolling(20).min().shift(1) # Previous 20-candle low for breakout checks
-    df["volume_sma"] = df["Volume"].rolling(20).mean() # Average volume for participation checks
-    df["volume_ratio"] = df["Volume"] / df["volume_sma"].replace(0, np.nan) # Current volume relative to recent average
-    df["volume_ratio"] = df["volume_ratio"].replace([np.inf, -np.inf], np.nan).fillna(1.0) # Keep volume ratio safe
+    df["atr"] = tr.rolling(14).mean()
+    df["atr_pct"] = df["atr"] / df["price"]
 
-    return df # Return the fully engineered dataframe
+    up_move = df["High"] - df["High"].shift(1)
+    down_move = df["Low"].shift(1) - df["Low"]
+    df["+dm"] = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    df["-dm"] = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    
+    df["+dm_smoothed"] = df["+dm"].ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    df["-dm_smoothed"] = df["-dm"].ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    df["atr_smoothed"] = tr.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    
+    df["+di"] = 100 * (df["+dm_smoothed"] / (df["atr_smoothed"] + 1e-9))
+    df["-di"] = 100 * (df["-dm_smoothed"] / (df["atr_smoothed"] + 1e-9))
+    df["dx"] = 100 * (abs(df["+di"] - df["-di"]) / (df["+di"] + df["-di"] + 1e-9))
+    df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+
+    df["recent_high"] = df["High"].rolling(20).max().shift(1)
+    df["recent_low"] = df["Low"].rolling(20).min().shift(1)
+    df["volume_sma"] = df["Volume"].rolling(20).mean()
+    df["volume_ratio"] = df["Volume"] / df["volume_sma"].replace(0, np.nan)
+    df["volume_ratio"] = df["volume_ratio"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    
+    # Adaptive Percentile Baselines
+    df["bb_width_pct_25"] = df["bb_width"].rolling(60, min_periods=1).quantile(0.25)
+    df["ema_diff"] = abs(df["ema_fast"] - df["ema_mid"]) / df["price"]
+    df["ema_diff_pct_75"] = df["ema_diff"].rolling(60, min_periods=1).quantile(0.75)
+
+    return df
 
 
 # ==============================
 # REGIME DETECTION (IMPROVED)
 # ==============================
-def get_market_regime(df): # Function to determine the current market trend/regime
+def get_market_regime(df):
+    if len(df) < 50:
+        return 0
 
-    if len(df) < 30: # Ensure there are enough candles to calculate EMAs reliably
-        return 0 # Return 0 (sideways/neutral) if insufficient data
+    c = df.iloc[-1]
+    
+    # Adaptive Sideways detection (Bottom 25% of recent volatility)
+    if c.get("bb_width", 1.0) < c.get("bb_width_pct_25", 0.002):
+        return 0
 
-    c = df.iloc[-1] # Extract the latest candle (the current row)
+    trend_up = c["ema_fast"] > c["ema_mid"] and c["price"] >= c["vwap"]
+    trend_down = c["ema_fast"] < c["ema_mid"] and c["price"] <= c["vwap"]
 
-    # Sideways detection using Bollinger Band Width (Volatility Squeeze)
-    if c.get("bb_width", 1.0) < 0.002: # Strict: If bands are tight (< 0.20% width), avoid chop
-        return 0 # Definitely sideways market
+    # Require top 25% trend spread to avoid sideways chop whipsaws
+    if c.get("ema_diff", 0) > c.get("ema_diff_pct_75", 0.0008):
+        if trend_up:
+            return 1
+        if trend_down:
+            return -1
 
-    ema_diff = abs(c["ema_fast"] - c["ema_mid"]) / c["price"] # Calculate the percentage spread between fast and mid EMAs
-
-    trend_up = c["ema_fast"] > c["ema_mid"] and c["price"] >= c["vwap"] # Define uptrend criteria
-    trend_down = c["ema_fast"] < c["ema_mid"] and c["price"] <= c["vwap"] # Define downtrend criteria
-
-    # Require strong trend spread to avoid sideways chop whipsaws
-    if ema_diff > 0.0008: # Strict: If the spread is significant enough (> 0.08%)
-        if trend_up: # If uptrend conditions are met
-            return 1 # Return 1 for Uptrend
-        if trend_down: # If downtrend conditions are met
-            return -1 # Return -1 for Downtrend
-
-    return 0 # Return 0 for Sideways/Chop if no clear trend is detected
+    return 0
 
 
 # ==============================
 # RISK MANAGEMENT
 # ==============================
-def risk_management(current=None, capital=100000, lot_size=50): # Determine risk limits per trade
+def risk_management(current=None, capital=100000, lot_size=50):
 
-    atr_pct = 0.002 # Default Average True Range percentage (0.2%)
-    brokerage_fee = 60.0 # Flat assumed brokerage fee per completed trade
-    slippage_bps = 0.0003 # Match execution slippage used by the live/paper loops
-    max_loss_per_trade_amount = capital * 0.03 # Hard cap: never plan more than 3% risk
+    atr_pct = 0.002
+    brokerage_fee = 60.0
+    slippage_bps = 0.0003
+    max_loss_per_trade_amount = capital * 0.03
 
-    if current is not None: # If current candle data is provided
-        try: # Safely attempt to extract recent ATR percentage
-            val = float(current.get("atr_pct", atr_pct)) # Fetch dynamic ATR pct
-            if np.isfinite(val) and val > 0: # Ensure valid positive number
-                atr_pct = val # Override default ATR with current market volatility
-        except: # Ignore extraction errors
-            pass # Fallback to default ATR
+    if current is not None:
+        try:
+            val = float(current.get("atr_pct", atr_pct))
+            if np.isfinite(val) and val > 0:
+                atr_pct = val
+        except:
+            pass
 
-    # Dynamic volatility stop, capped so one configured lot stays inside the 3% risk budget.
+    # Robust dynamic volatility stop, capped so one configured lot stays inside the risk budget.
     base_stop_loss_pct = max(0.0030, atr_pct * 2.5)
     stop_loss_pct = base_stop_loss_pct
+    
     if current is not None:
         try:
             price = float(current.get("price", 0.0))
@@ -163,29 +178,27 @@ def risk_management(current=None, capital=100000, lot_size=50): # Determine risk
             if max_stop_for_one_lot > 0:
                 stop_loss_pct = min(base_stop_loss_pct, max_stop_for_one_lot)
     
-    # Target is dynamically set to 2.0x the actual risk (1:2 Risk/Reward) for higher profitability
-    target_pct = stop_loss_pct * 2.0 
-    
-    # Move to breakeven when profit safely reaches 1.0x risk
+    # Target is dynamically set to 2.5x the actual risk for high expectancy
+    target_pct = stop_loss_pct * 2.5 
+    # Move to breakeven when profit reaches 1.0x risk
     breakeven_pct = stop_loss_pct * 1.0  
-    
-    # Trail distance tightened to lock in profits effectively (0.8x risk)
-    trail_distance = stop_loss_pct * 0.8  
+    # Tight trailing distance to secure profits
+    trail_distance = stop_loss_pct * 0.5  
 
-    return { # Return the risk parameter dictionary
-        "stop_loss_pct": stop_loss_pct, # Output calculated SL pct
-        "target_pct": target_pct, # Output calculated Target pct
-        "breakeven_pct": breakeven_pct, # Output breakeven trigger pct
-        "trail_distance": trail_distance, # Output trailing distance pct
-        "brokerage_fee": brokerage_fee, # Flat assumed brokerage fee per trade
-        "risk_per_trade_pct": 0.03, # Risk max 3% per trade
-        "max_loss_per_trade_amount": max_loss_per_trade_amount, # Absolute per-trade risk ceiling in rupees
-        "daily_loss_limit_pct": 3000.0 / capital, # STRICT max daily loss limit is exact 3000.0 rupees
-        "profit_protection_start_amount": 1000.0, # Protect session gains earlier (at 1000 profit)
-        "profit_giveback_pct": 0.20, # Conserve 80% of peak daily profit, stop entries if 20% given back
-        "lot_size": lot_size, # Instrument lot size
-        "capital": capital, # Total working capital
-        "slippage_bps": slippage_bps, # Execution slippage assumption
+    return {
+        "stop_loss_pct": stop_loss_pct,
+        "target_pct": target_pct,
+        "breakeven_pct": breakeven_pct,
+        "trail_distance": trail_distance,
+        "brokerage_fee": brokerage_fee,
+        "risk_per_trade_pct": 0.03,
+        "max_loss_per_trade_amount": max_loss_per_trade_amount,
+        "daily_loss_limit_pct": 3000.0 / capital,
+        "profit_protection_start_amount": 1000.0,
+        "profit_giveback_pct": 0.20,
+        "lot_size": lot_size,
+        "capital": capital,
+        "slippage_bps": slippage_bps,
     }
 
 
@@ -201,152 +214,134 @@ def calculate_position_size(
     max_loss_per_trade_amount=3000.0,
     brokerage_fee=60.0,
     slippage_bps=0.0003,
-): # Determines how many lots to buy/sell
+):
+    if price <= 0 or stop_loss_pct <= 0:
+        return 0
 
-    if price <= 0 or stop_loss_pct <= 0: # Catch invalid prices or zero stop loss
-        return 0 # Reject unsafe sizing inputs
-
-    risk_amount = min(capital * risk_per_trade_pct, max_loss_per_trade_amount) # Absolute hard cap wins over percentage risk
-    usable_risk_amount = max(0.0, risk_amount - brokerage_fee) # Reserve brokerage so net loss stays inside the cap
-    per_unit_risk = price * (stop_loss_pct + (slippage_bps * 2)) # Entry and exit slippage are included in planned risk
-    if per_unit_risk <= 0 or usable_risk_amount <= 0: # Avoid division by zero errors
-        return 0 # Reject if we cannot size under the risk cap
-
-    risk_qty = int(np.floor(usable_risk_amount / per_unit_risk)) # Calculate affordable raw quantity based on risk limit
+    risk_amount = min(capital * risk_per_trade_pct, max_loss_per_trade_amount)
+    usable_risk_amount = max(0.0, risk_amount - brokerage_fee)
+    per_unit_risk = price * (stop_loss_pct + (slippage_bps * 2))
     
-    # Calculate valid F&O lot multipliers
+    if per_unit_risk <= 0 or usable_risk_amount <= 0:
+        return 0
+
+    risk_qty = int(np.floor(usable_risk_amount / per_unit_risk))
     lots = risk_qty // lot_size
     
-    if lots < 1: # If risk is too tight for even 1 lot, skip instead of exceeding the cap
+    if lots < 1:
         return 0
         
-    return lots * lot_size # Return the total raw quantity of shares/contracts scaled to lot size
+    return lots * lot_size
 
 
 # ==============================
 # SIGNAL LOGIC
 # ==============================
-def trend_signal(c, regime): # Core rules for trend following entries
-    
-    if c.get("bb_width", 1.0) < 0.002: # Filter low volatility
+def trend_signal(c, regime):
+    """
+    VWAP BOUNCE STRATEGY
+    High expectancy strategy entering pullbacks to VWAP/EMA in a strong trend.
+    """
+    if regime == 0:
         return "WAIT"
 
-    if regime == 1: # If market is in an uptrend
-        if (c["price"] > c["ema_fast"] > c["ema_mid"] and 
-            c["price"] >= c["vwap"] and 
-            55 < c["rsi"] < 75 and 
-            c["macd"] > c["macd_signal"]): # Check bullish alignments and momentum
-            return "BUY_LONG" # Output Long Signal
-
-    if regime == -1: # If market is in a downtrend
-        if (c["price"] < c["ema_fast"] < c["ema_mid"] and 
-            c["price"] <= c["vwap"] and 
-            25 < c["rsi"] < 45 and 
-            c["macd"] < c["macd_signal"]): # Check bearish alignments and momentum
-            return "SELL_SHORT" # Output Short Signal
-
-    return "WAIT" # No valid entry found
-
-
-def mean_reversion_signal(c, regime): # DISABLED - use VWAP breakout instead
-    """
-    Mean reversion on 5-min candles doesn't work.
-    Use bollinger_reversion_signal (VWAP breakout) for better results.
-    """
-    return "WAIT"
-
-
-def bollinger_reversion_signal(c, regime): # BALANCED: Quality breakouts with light regime filter
-    """
-    BALANCED BREAKOUT (works both trending and sideways):
-    - Light regime filter (allows some sideways breakouts)
-    - Price must clear recent_high/low by 0.3%+ (less strict than breakout_signal)
-    - Good volume + healthy RSI for quality
-    """
-
-    if pd.isna(c.get("recent_high")) or pd.isna(c.get("recent_low")):
-        return "WAIT"
-
-    has_vol = c.get("volume_sma", 0.0) > 0
-    volume_ok = c.get("volume_ratio", 1.0) >= 1.0 if has_vol else True
     price = c["price"]
-    
-    # LONG: Moderate breakout above recent high
-    if (price > c["recent_high"] * 1.0002 and  # 0.02% above recent high 
-        volume_ok and
-        35 <= c["rsi"] <= 85 and  # Healthy momentum range
-        regime >= 0):  # Uptrend or sideways, NOT downtrend
-        return "BUY_LONG"
 
-    # SHORT: Moderate breakout below recent low
-    if (price < c["recent_low"] * 0.9998 and  # 0.02% below recent low
-        volume_ok and
-        15 <= c["rsi"] <= 65 and  # Healthy momentum range
-        regime <= 0):  # Downtrend or sideways, NOT uptrend
-        return "SELL_SHORT"
+    # Trend alignment (slightly loosened to capture earlier trends)
+    bull_trend = c["ema_fast"] > c["ema_mid"] and c["ema_slow"] > c["vwap"] * 0.998
+    bear_trend = c["ema_fast"] < c["ema_mid"] and c["ema_slow"] < c["vwap"] * 1.002
 
-    return "WAIT"
+    # Pullback to value zone (widened value zone for more opportunities)
+    value_zone_long = c["ema_fast"] * 1.002 >= price >= c["vwap"] * 0.998
+    value_zone_short = c["ema_fast"] * 0.998 <= price <= c["vwap"] * 1.002
 
+    # Momentum turning back in direction of trend
+    mom_up = c.get("macd_hist_slope", 0) > 0 and c["macd"] > c["macd_signal"]
+    mom_down = c.get("macd_hist_slope", 0) < 0 and c["macd"] < c["macd_signal"]
 
-def fusion_strategy_signal(c, regime): # strategy_4
-
-    """
-    STRONG MOMENTUM TREND STRATEGY (MACD + EMA + VWAP)
-    - Excludes sideways markets using BB Width & Regime
-    - Entries triggered on strong MACD momentum and EMA alignments
-    - Price must be strongly trending above/below VWAP
-    """
-
-    if pd.isna(c.get("recent_high")) or pd.isna(c.get("recent_low")):
-        return "WAIT"
-        
-    # 1. Sideways Market Filter
-    if c.get("bb_width", 1.0) < 0.002: # Must have volatility/expansion
-        return "WAIT"
-
-    # 2. Volume/OI Proxy Filter (Quantity & Institutional Interest)
-    has_vol = c.get("volume_sma", 0.0) > 0
-    # Require average volume instead of 20% exceptionally high volume
-    volume_ok = c.get("volume_ratio", 1.0) >= 1.0 if has_vol else True
-    price = c["price"]
-    
-    # 3. LONG: Trend Analysis + Momentum
-    if regime == 1: 
-        if (price > c["vwap"] and                 # Must be above VWAP (Trend support)
-            c["ema_fast"] > c["ema_mid"] and      # Fast EMA above Mid EMA (Trend confirmation)
-            price > c["ema_fast"] and             # Price is pushing up above short term average
-            volume_ok and                         # Institutional volume confirmation
-            55 <= c["rsi"] <= 75 and              # Bullish momentum intact, not extremely overbought
-            c["macd"] > c["macd_signal"] and      # Confirmed Bullish MACD crossover
-            c.get("macd_hist_slope", 0) > 0):     # Momentum is actively increasing
+    if regime == 1 and bull_trend:
+        if (value_zone_long and 
+            mom_up and
+            45 < c["rsi"] < 70):
             return "BUY_LONG"
 
-    # 4. SHORT: Trend Analysis + Momentum
-    if regime == -1:
-        if (price < c["vwap"] and                 # Must be below VWAP (Trend resistance)
-            c["ema_fast"] < c["ema_mid"] and      # Fast EMA below Mid EMA (Trend confirmation)
-            price < c["ema_fast"] and             # Price is pushing down below short term average
-            volume_ok and                         # Institutional volume confirmation
-            25 <= c["rsi"] <= 45 and              # Bearish momentum intact, not extremely oversold
-            c["macd"] < c["macd_signal"] and      # Confirmed Bearish MACD crossover
-            c.get("macd_hist_slope", 0) < 0):     # Momentum is actively decreasing
+    if regime == -1 and bear_trend:
+        if (value_zone_short and 
+            mom_down and
+            30 < c["rsi"] < 55):
             return "SELL_SHORT"
 
     return "WAIT"
 
 
-def select_entry_signal(current, regime, strategy_name): # Route configured strategy to its own entry rules
+def bollinger_reversion_signal(c, regime):
+    if pd.isna(c.get("recent_high")) or pd.isna(c.get("recent_low")):
+        return "WAIT"
 
+    has_vol = c.get("volume_sma", 0.0) > 0
+    volume_ok = c.get("volume_ratio", 1.0) >= 1.0 if has_vol else True
+    price = c["price"]
+    
+    if (price > c["recent_high"] * 1.0002 and
+        volume_ok and
+        35 <= c["rsi"] <= 85 and
+        regime >= 0):
+        return "BUY_LONG"
+
+    if (price < c["recent_low"] * 0.9998 and
+        volume_ok and
+        15 <= c["rsi"] <= 65 and
+        regime <= 0):
+        return "SELL_SHORT"
+
+    return "WAIT"
+
+
+def fusion_strategy_signal(c, regime):
+    if pd.isna(c.get("recent_high")) or pd.isna(c.get("recent_low")):
+        return "WAIT"
+        
+    if c.get("bb_width", 1.0) < 0.002:
+        return "WAIT"
+
+    has_vol = c.get("volume_sma", 0.0) > 0
+    volume_ok = c.get("volume_ratio", 1.0) >= 1.0 if has_vol else True
+    price = c["price"]
+    
+    if regime == 1: 
+        if (price > c["vwap"] and
+            c["ema_fast"] > c["ema_mid"] and
+            price > c["ema_fast"] and
+            volume_ok and
+            55 <= c["rsi"] <= 75 and
+            c["macd"] > c["macd_signal"] and
+            c.get("macd_hist_slope", 0) > 0):
+            return "BUY_LONG"
+
+    if regime == -1:
+        if (price < c["vwap"] and
+            c["ema_fast"] < c["ema_mid"] and
+            price < c["ema_fast"] and
+            volume_ok and
+            25 <= c["rsi"] <= 45 and
+            c["macd"] < c["macd_signal"] and
+            c.get("macd_hist_slope", 0) < 0):
+            return "SELL_SHORT"
+
+    return "WAIT"
+
+
+def select_entry_signal(current, regime, strategy_name):
     if strategy_name == "strategy_1":
         return trend_signal(current, regime)
     if strategy_name == "strategy_2":
-        return bollinger_reversion_signal(current, regime)  # VWAP breakout - works always
+        return bollinger_reversion_signal(current, regime)
     if strategy_name == "strategy_3":
-        return bollinger_reversion_signal(current, regime)  # VWAP breakout - works always
+        return bollinger_reversion_signal(current, regime)
     if strategy_name == "strategy_4":
         return fusion_strategy_signal(current, regime)
 
-    action = bollinger_reversion_signal(current, regime)  # Default to VWAP
+    action = bollinger_reversion_signal(current, regime)
     if action == "WAIT":
         action = trend_signal(current, regime)
     return action
@@ -355,91 +350,88 @@ def select_entry_signal(current, regime, strategy_name): # Route configured stra
 # ==============================
 # MAIN SIGNAL ENGINE
 # ==============================
-def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwargs): # Master logic router
+def calculate_signals(price_list, current_time, position=0, entry_price=0, **kwargs):
 
-    candles_df = kwargs.get("candles_df") # Fetch provided DataFrame from kwargs
-    capital = kwargs.get("capital", 100000) # Fetch configured capital
-    lot_size = kwargs.get("lot_size", 50) # Fetch configured lot size
-    strategy_name = kwargs.get("strategy_name", "strategy_1") # Fetch active strategy selector
+    candles_df = kwargs.get("candles_df")
+    capital = kwargs.get("capital", 100000)
+    lot_size = kwargs.get("lot_size", 50)
+    strategy_name = kwargs.get("strategy_name", "strategy_1")
 
-    if candles_df is None and (price_list is None or len(price_list) < MIN_SIGNAL_CANDLES): # Sanity check for minimum data
-        return {"action": "WAIT"} # Wait for more data
+    if candles_df is None and (price_list is None or len(price_list) < MIN_SIGNAL_CANDLES):
+        return {"action": "WAIT"}
 
-    df = get_base_df(price_list=price_list, candles_df=candles_df) # Process technical indicators
+    df = get_base_df(price_list=price_list, candles_df=candles_df)
 
-    if len(df) < MIN_SIGNAL_CANDLES: # Confirm again we have enough history post-processing
-        return {"action": "WAIT"} # Wait for more data
+    if len(df) < MIN_SIGNAL_CANDLES:
+        return {"action": "WAIT"}
 
-    current = df.iloc[-1] # Get the current (most recent) candle data
+    current = df.iloc[-1]
+    regime = get_market_regime(df)
+    risk = risk_management(current=current, capital=capital, lot_size=lot_size)
 
-    regime = get_market_regime(df) # Evaluate current market state (-1, 0, 1)
-    risk = risk_management(current=current, capital=capital, lot_size=lot_size) # Evaluate dynamic risk parameters
-
-    qty = calculate_position_size( # Calculate safest trade quantity
-        price=float(current["price"]), # Current entry price
-        stop_loss_pct=risk["stop_loss_pct"], # Risk percentage
-        capital=capital, # Total capital limit
-        lot_size=lot_size, # Block size
-        risk_per_trade_pct=risk["risk_per_trade_pct"], # Risk profile
-        max_loss_per_trade_amount=risk["max_loss_per_trade_amount"], # Absolute risk ceiling
-        brokerage_fee=risk["brokerage_fee"], # Include costs in sizing
+    qty = calculate_position_size(
+        price=float(current["price"]),
+        stop_loss_pct=risk["stop_loss_pct"],
+        capital=capital,
+        lot_size=lot_size,
+        risk_per_trade_pct=risk["risk_per_trade_pct"],
+        max_loss_per_trade_amount=risk["max_loss_per_trade_amount"],
+        brokerage_fee=risk["brokerage_fee"],
     ) 
 
     # ================= ENTRY =================
-    action = "WAIT" # Default outcome is to do nothing
+    action = "WAIT"
 
-    if position == 0 and qty > 0: # If we are flat and sized safely
-        # Avoid opening new trades too late in the day (after 14:15) to prevent forced DAY_CLOSE losses
+    if position == 0 and qty > 0:
         is_too_late = False
         if hasattr(current_time, "hour"):
             market_minute = current_time.hour * 60 + current_time.minute
-            if market_minute >= LATEST_ENTRY_MINUTE: # Stop late entries while still allowing trend continuation trades
+            if market_minute >= LATEST_ENTRY_MINUTE:
                 is_too_late = True
                 
         if not is_too_late:
-                action = select_entry_signal(current, regime, strategy_name) # Evaluate configured entry setup
+            action = select_entry_signal(current, regime, strategy_name)
 
-                # Global safety gate: avoid opening SHORTs when RSI is very low (deeply oversold)
-                try:
-                    current_rsi = float(current.get("rsi", 50.0))
-                except Exception:
-                    current_rsi = 50.0
+            try:
+                current_rsi = float(current.get("rsi", 50.0))
+            except Exception:
+                current_rsi = 50.0
 
-                if action == "SELL_SHORT" and current_rsi < SHORT_MIN_RSI:
-                    action = "WAIT"
+            if action == "SELL_SHORT" and current_rsi < SHORT_MIN_RSI:
+                action = "WAIT"
 
     # ================= EXIT =================
-    elif position > 0: # If we are in a LONG trade
-        if regime == -1 or current["price"] < current["ema_slow"]: # Bail if trend flips down or we break below Slow EMA (50)
-            action = "EXIT_LONG" # Force exit
+    elif position > 0:
+        if regime == -1 or current["price"] < current["ema_slow"]:
+            action = "EXIT_LONG"
 
-    elif position < 0: # If we are in a SHORT trade
-        if regime == 1 or current["price"] > current["ema_slow"]: # Bail if trend flips up or we break above Slow EMA (50)
-            action = "EXIT_SHORT" # Force exit
+    elif position < 0:
+        if regime == 1 or current["price"] > current["ema_slow"]:
+            action = "EXIT_SHORT"
 
-    return { # Return the calculated action and context parameters for execution
-        "action": action, # 'BUY_LONG', 'SELL_SHORT', 'EXIT_LONG', 'EXIT_SHORT', or 'WAIT'
-        "price": round(float(current["price"]), 2), # Snapshot price
-        "ema_fast": round(float(current["ema_fast"]), 2), # Snapshot Fast EMA
-        "ema_mid": round(float(current["ema_mid"]), 2), # Snapshot Mid EMA
-        "vwap": round(float(current["vwap"]), 2), # Snapshot VWAP
-        "ema_f": round(float(current["ema_fast"]), 2), # Backward-compatible alias used by CSV reports
-        "rsi": round(float(current["rsi"]), 2), # Snapshot RSI
-        "rsi_fast": round(float(current["rsi"]), 2), # Backward-compatible alias used by CSV reports
-        "entry_score": round(float(current.get("rsi", 50.0)), 2), # Provide a metric for reporting
-        "atr_pct": round(float(current["atr_pct"]), 5) if pd.notna(current["atr_pct"]) else None, # Snapshot Volatility
-        "atr": round(float(current["atr"]), 2) if pd.notna(current["atr"]) else None, # Snapshot ATR points
-        "volume_ratio": round(float(current["volume_ratio"]), 2) if pd.notna(current["volume_ratio"]) else None, # Volume participation snapshot
-        "regime": regime, # Current Market State
-        "strategy_name": strategy_name, # Active strategy selector
-        "stop_loss_pct": risk["stop_loss_pct"], # Assigned SL parameter
-        "target_pct": risk["target_pct"], # Assigned Target parameter
-        "breakeven_pct": risk["breakeven_pct"], # Assigned Breakeven parameter
-        "trail_distance": risk["trail_distance"], # Assigned Trailing parameter
-        "suggested_qty": qty, # Total Quantity Size
-        "brokerage_fee": risk["brokerage_fee"], # Brokerage used for risk checks and PnL
-        "max_loss_per_trade_amount": risk["max_loss_per_trade_amount"], # Hard per-trade loss cap
-        "daily_loss_limit_pct": risk["daily_loss_limit_pct"], # Session/day circuit breaker
-        "profit_protection_start_amount": risk["profit_protection_start_amount"], # Profit protection threshold
-        "profit_giveback_pct": risk["profit_giveback_pct"], # Allowed giveback after peak profit
+    return {
+        "action": action,
+        "price": round(float(current["price"]), 2),
+        "ema_fast": round(float(current["ema_fast"]), 2),
+        "ema_mid": round(float(current["ema_mid"]), 2),
+        "vwap": round(float(current["vwap"]), 2),
+        "ema_f": round(float(current["ema_fast"]), 2),
+        "rsi": round(float(current["rsi"]), 2),
+        "rsi_fast": round(float(current["rsi"]), 2),
+        "entry_score": round(float(current.get("rsi", 50.0)), 2),
+        "atr_pct": round(float(current["atr_pct"]), 5) if pd.notna(current["atr_pct"]) else None,
+        "atr": round(float(current["atr"]), 2) if pd.notna(current["atr"]) else None,
+        "volume_ratio": round(float(current["volume_ratio"]), 2) if pd.notna(current["volume_ratio"]) else None,
+        "regime": regime,
+        "strategy_name": strategy_name,
+        "stop_loss_pct": risk["stop_loss_pct"],
+        "target_pct": risk["target_pct"],
+        "breakeven_pct": risk["breakeven_pct"],
+        "trail_distance": risk["trail_distance"],
+        "suggested_qty": qty,
+        "brokerage_fee": risk["brokerage_fee"],
+        "max_loss_per_trade_amount": risk["max_loss_per_trade_amount"],
+        "daily_loss_limit_pct": risk["daily_loss_limit_pct"],
+        "profit_protection_start_amount": risk["profit_protection_start_amount"],
+        "profit_giveback_pct": risk["profit_giveback_pct"],
     }
